@@ -1,7 +1,7 @@
 # Tricky Cases
 
-Tree diffing is challenging in some situations. This page demonstrates
-difficult cases observed during development.
+Tree diffing is challenging in some situations. This page discusses
+difficult cases, and how difftastic handles them.
 
 Not all of these cases work well in difftastic yet.
 
@@ -27,6 +27,9 @@ to display this case clearly: we want to highlight the changed
 delimiters, but not their content. This is challenging in larger
 expressions.
 
+**Difftastic**: Difftastic considers nodes to be equal even at
+different depths, achieving the desired result in this case.
+
 ## Changing Delimiters
 
 ```
@@ -37,10 +40,12 @@ expressions.
 [x]
 ```
 
-Desired result: <code><span style="background-color: #fbbd98; color: #000">(</span>x<span style="background-color: #fbbd98; color: #000">)</span> <span style="background-color: PaleGreen; color: #000">[</span>x<span style="background-color: PaleGreen; color: #000">]</span></code>
+Desired result: <code><span style="background-color: #fbbd98; color: #000">(</span>x<span style="background-color: #fbbd98; color: #000">)</span></code>, <code><span style="background-color: PaleGreen; color: #000">[</span>x<span style="background-color: PaleGreen; color: #000">]</span></code>
 
 As with the wrapping case, we want to highlight the delimiters rather
 than the `x`.
+
+**Difftastic**: Difftastic handles this correctly through its tree diffing.
 
 ## Expanding Delimiters
 
@@ -52,10 +57,15 @@ than the `x`.
 (x y)
 ```
 
-Desired result: <code>(x <span style="background-color: PaleGreen; color: #000">y</span>)</code>
+Possible result 1: <code><span style="background-color: #fbbd98; color: #000">(</span>x<span style="background-color: #fbbd98; color: #000">)</span> y</code>, <code><span style="background-color: PaleGreen; color: #000">(</span>x y<span style="background-color: PaleGreen; color: #000">)</span></code>
 
-In this case, we want to highlight `y`. Highlighting the delimiters
-could make `x` look changed.
+Possible result 2: <code>(x) <span style="background-color: #fbbd98; color: #000">y</span></code>, <code>(x <span style="background-color: PaleGreen; color: #000">y</span>)</code>
+
+It's not clear which is better in this case.
+
+**Difftastic**: Difftastic currently shows result 2, but this case is
+sensitive to the cost model. Some previous versions of difftastic have
+shown result 1.
 
 ## Contracting Delimiters
 
@@ -67,7 +77,7 @@ could make `x` look changed.
 (x) y
 ```
 
-This should be highlighted similar to the expanding delimiter case.
+This case is similar to the expanding delimiter case.
 
 ## Disconnected Delimiters
 
@@ -79,7 +89,7 @@ This should be highlighted similar to the expanding delimiter case.
 (foo (novel) (bar))
 ```
 
-Desired result: <code>(foo <span style="background-color:PaleGreen; color: #000">(novel)</span> (bar)</code>
+Desired result: <code>(foo <span style="background-color:PaleGreen; color: #000">(novel)</span> (bar))</code>
 
 It is easy to end up with
 <code>(foo (<span style="background-color:PaleGreen; color: #000">novel</span>) <span style="background-color:PaleGreen; color: #000">(</span>bar<span style="background-color:PaleGreen; color: #000">)</span>)</code>,
@@ -345,7 +355,7 @@ still want to know when whitespace changes inside strings. `" "` and
 // Before
 foo("looooong", "also looooong");
 
-// Before
+// After
 foo(
   "looooong",
   "novel",
@@ -360,6 +370,39 @@ the most common.
 Syntactic diffing can ignore whitespace changes, but it has to assume
 punctuation is meaningful. This can lead to punctuation changes being
 highlighted, which may be quite far from the relevant content change.
+
+## Unordered Data Types
+
+```
+// Before
+set(1, 2)
+
+// After
+set(2, 1)
+```
+
+Users may expect difftastic to find no changes here. This is difficult
+for several reasons.
+
+For programming languages, side effects might make the order
+relevant. `set(foo(), bar())` might behave differently to `set(bar(),
+foo())`.
+
+For configuration languages like JSON or YAML, some parser
+implementations do actually expose ordering information
+(e.g. `object_pairs_hook=OrderedDict` in Python, or serde_json's
+`preserve_order` feature in Rust).
+
+To make matters worse, unordered tree diffing is NP-hard.
+
+> For the unordered case, it turns out that all of the problems in
+> general are NP-hard. Indeed, the tree edit distance and alignment
+> distance problems are even MAX SNP-hard.
+>
+> -- [A survey on tree edit distance and related problems](https://doi.org/10.1016/j.tcs.2004.12.030)
+
+**Difftastic**: Difftastic considers ordering to be meaningful
+everywhere, so it will always report ordering changes.
 
 ## Novel Blank Lines
 
@@ -422,5 +465,17 @@ There's no guarantee that the input we're given is valid syntax. Even
 if the code is valid, it might use syntax that isn't supported by the
 parser.
 
-Tree-sitter provided explicit error nodes, and difftastic treats them
-as atoms so it can run the same tree diff algorithm regardless.
+**Difftastic**: Difftastic will fall back to a text-based diff if any
+parse errors occur, to avoid diffing incomplete syntax trees. When
+this occurs, the file header reports the error count.
+
+```
+$ difft sample_files/syntax_error_1.js sample_files/syntax_error_2.js
+sample_files/syntax_error_after.js --- Text (2 errors, exceeded DFT_PARSE_ERROR_LIMIT)
+...
+```
+
+Users may opt-in to syntactic diffing by setting
+`DFT_PARSE_ERROR_LIMIT` to a larger value. In this mode, difftastic
+treats tree-sitter error nodes as atoms and performs a tree diff as
+normal.

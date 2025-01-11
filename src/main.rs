@@ -15,34 +15,61 @@
 // Has false positives on else if chains that sometimes have the same
 // body for readability.
 #![allow(clippy::if_same_then_else)]
+// Good practice in general, but a necessary evil for Syntax. Its Hash
+// implementation does not consider the mutable fields, so it is still
+// correct.
+#![allow(clippy::mutable_key_type)]
+// It's sometimes more readable to explicitly create a vec than to use
+// the Default trait.
+#![allow(clippy::manual_unwrap_or_default)]
+// .to_owned() is more explicit on string references.
+#![warn(clippy::str_to_string)]
+// .to_string() on a String is clearer as .clone().
+#![warn(clippy::string_to_string)]
+// Debugging features shouldn't be in checked-in code.
+#![warn(clippy::todo)]
+#![warn(clippy::dbg_macro)]
 
+mod conflicts;
 mod constants;
 mod diff;
 mod display;
+mod exit_codes;
 mod files;
+mod hash;
 mod line_parser;
 mod lines;
 mod options;
 mod parse;
-mod positions;
 mod summary;
+mod version;
+mod words;
 
 #[macro_use]
 extern crate log;
 
-use crate::diff::{dijkstra, unchanged};
-use crate::display::hunks::{matched_pos_to_hunks, merge_adjacent};
-use crate::parse::guess_language::LANG_EXTENSIONS;
-use crate::parse::syntax;
-use diff::changes::ChangeMap;
-use diff::dijkstra::ExceededGraphLimit;
-use display::context::opposite_positions;
-use files::{
-    guess_content, read_files_or_die, read_or_die, relative_paths_in_either, ProbableFileKind,
-};
+use display::style::print_warning;
 use log::info;
 use mimalloc::MiMalloc;
-use parse::guess_language::{guess, language_name};
+use options::FilePermissions;
+use options::USAGE;
+
+use crate::conflicts::apply_conflict_markers;
+use crate::conflicts::START_LHS_MARKER;
+use crate::diff::changes::ChangeMap;
+use crate::diff::dijkstra::ExceededGraphLimit;
+use crate::diff::{dijkstra, unchanged};
+use crate::display::context::opposite_positions;
+use crate::display::hunks::{matched_pos_to_hunks, merge_adjacent};
+use crate::exit_codes::EXIT_BAD_ARGUMENTS;
+use crate::exit_codes::{EXIT_FOUND_CHANGES, EXIT_SUCCESS};
+use crate::files::{
+    guess_content, read_file_or_die, read_files_or_die, read_or_die, relative_paths_in_either,
+    ProbableFileKind,
+};
+use crate::parse::guess_language::language_globs;
+use crate::parse::guess_language::{guess, language_name, Language, LanguageOverride};
+use crate::parse::syntax;
 
 /// The global allocator used by difftastic.
 ///
@@ -51,15 +78,19 @@ use parse::guess_language::{guess, language_name};
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use diff::sliders::fix_all_sliders;
-use options::{DisplayMode, DisplayOptions, FileArgument, Mode, DEFAULT_TAB_WIDTH};
+use std::path::Path;
+use std::{env, thread};
+
+use humansize::{format_size, BINARY};
 use owo_colors::OwoColorize;
 use rayon::prelude::*;
-use std::{env, path::Path};
-use summary::{DiffResult, FileContent};
-use syntax::init_next_prev;
+use strum::IntoEnumIterator;
 use typed_arena::Arena;
 
+use crate::diff::sliders::fix_all_sliders;
+use crate::options::{DiffOptions, DisplayMode, DisplayOptions, FileArgument, Mode};
+use crate::summary::{DiffResult, FileContent, FileFormat};
+use crate::syntax::init_next_prev;
 use crate::{
     dijkstra::mark_syntax, lines::MaxLine, parse::syntax::init_all_info,
     parse::tree_sitter_parser as tsp,
@@ -82,25 +113,24 @@ fn reset_sigpipe() {
 
 /// The entrypoint.
 fn main() {
-    pretty_env_logger::init_timed();
+    pretty_env_logger::try_init_timed_custom_env("DFT_LOG")
+        .expect("The logger has not been previously initialized");
     reset_sigpipe();
 
     match options::parse_args() {
         Mode::DumpTreeSitter {
             path,
-            language_override,
+            language_overrides,
         } => {
             let path = Path::new(&path);
             let bytes = read_or_die(path);
             let src = String::from_utf8_lossy(&bytes).to_string();
-            // TODO: Load display options rather than hard-coding.
-            let src = replace_tabs(&src, DEFAULT_TAB_WIDTH);
 
-            let language = language_override.or_else(|| guess(path, &src));
+            let language = guess(path, &src, &language_overrides);
             match language {
                 Some(lang) => {
                     let ts_lang = tsp::from_language(lang);
-                    let tree = tsp::parse_to_tree(&src, &ts_lang);
+                    let tree = tsp::to_tree(&src, &ts_lang);
                     tsp::print_tree(&src, &tree);
                 }
                 None => {
@@ -110,20 +140,19 @@ fn main() {
         }
         Mode::DumpSyntax {
             path,
-            language_override,
+            ignore_comments,
+            language_overrides,
         } => {
             let path = Path::new(&path);
             let bytes = read_or_die(path);
             let src = String::from_utf8_lossy(&bytes).to_string();
-            // TODO: Load display options rather than hard-coding.
-            let src = replace_tabs(&src, DEFAULT_TAB_WIDTH);
 
-            let language = language_override.or_else(|| guess(path, &src));
+            let language = guess(path, &src, &language_overrides);
             match language {
                 Some(lang) => {
                     let ts_lang = tsp::from_language(lang);
                     let arena = Arena::new();
-                    let ast = tsp::parse(&arena, &src, &ts_lang);
+                    let ast = tsp::parse(&arena, &src, &ts_lang, ignore_comments);
                     init_all_info(&ast, &[]);
                     println!("{:#?}", ast);
                 }
@@ -132,33 +161,98 @@ fn main() {
                 }
             }
         }
-        Mode::ListLanguages { use_color } => {
-            for (language, extensions) in LANG_EXTENSIONS {
-                let mut name = language_name(*language).to_string();
+        Mode::DumpSyntaxDot {
+            path,
+            ignore_comments,
+            language_overrides,
+        } => {
+            let path = Path::new(&path);
+            let bytes = read_or_die(path);
+            let src = String::from_utf8_lossy(&bytes).to_string();
+
+            let language = guess(path, &src, &language_overrides);
+            match language {
+                Some(lang) => {
+                    let ts_lang = tsp::from_language(lang);
+                    let arena = Arena::new();
+                    let ast = tsp::parse(&arena, &src, &ts_lang, ignore_comments);
+                    init_all_info(&ast, &[]);
+                    syntax::print_as_dot(&ast);
+                }
+                None => {
+                    eprintln!("No tree-sitter parser for file: {:?}", path);
+                }
+            }
+        }
+        Mode::ListLanguages {
+            use_color,
+            language_overrides,
+        } => {
+            for (lang_override, globs) in language_overrides {
+                let mut name = match lang_override {
+                    LanguageOverride::Language(lang) => language_name(lang),
+                    LanguageOverride::PlainText => "Text",
+                }
+                .to_owned();
                 if use_color {
                     name = name.bold().to_string();
                 }
-                print!("{}", name);
+                println!("{} (from override)", name);
+                for glob in globs {
+                    print!(" {}", glob.as_str());
+                }
+                println!();
+            }
 
-                let mut extensions: Vec<&str> = (*extensions).into();
-                extensions.sort_unstable();
+            for language in Language::iter() {
+                let mut name = language_name(language).to_owned();
+                if use_color {
+                    name = name.bold().to_string();
+                }
+                println!("{}", name);
 
-                for extension in extensions {
-                    print!(" .{}", extension);
+                for glob in language_globs(language) {
+                    print!(" {}", glob.as_str());
                 }
                 println!();
             }
         }
-        Mode::Diff {
-            graph_limit,
-            byte_limit,
+        Mode::DiffFromConflicts {
+            display_path,
+            path,
+            diff_options,
             display_options,
-            missing_as_empty,
-            language_override,
+            set_exit_code,
+            language_overrides,
+        } => {
+            let diff_result = diff_conflicts_file(
+                &display_path,
+                &path,
+                &display_options,
+                &diff_options,
+                &language_overrides,
+            );
+
+            print_diff_result(&display_options, &diff_result);
+
+            let exit_code = if set_exit_code && diff_result.has_reportable_change() {
+                EXIT_FOUND_CHANGES
+            } else {
+                EXIT_SUCCESS
+            };
+            std::process::exit(exit_code);
+        }
+        Mode::Diff {
+            diff_options,
+            display_options,
+            set_exit_code,
+            language_overrides,
             lhs_path,
             rhs_path,
-            lhs_display_path,
-            rhs_display_path,
+            lhs_permissions,
+            rhs_permissions,
+            display_path,
+            renamed,
         } => {
             if lhs_path == rhs_path {
                 let is_dir = match &lhs_path {
@@ -166,235 +260,501 @@ fn main() {
                     _ => false,
                 };
 
-                eprintln!(
-                    "warning: You've specified the same {} twice.\n",
-                    if is_dir { "directory" } else { "file" }
+                print_warning(
+                    &format!(
+                        "You've specified the same {} twice.",
+                        if is_dir { "directory" } else { "file" }
+                    ),
+                    &display_options,
                 );
             }
 
+            let mut encountered_changes = false;
             match (&lhs_path, &rhs_path) {
                 (
                     options::FileArgument::NamedPath(lhs_path),
                     options::FileArgument::NamedPath(rhs_path),
                 ) if lhs_path.is_dir() && rhs_path.is_dir() => {
-                    diff_directories(
+                    // Diffs in parallel when iterating this iterator.
+                    let diff_iter = diff_directories(
                         lhs_path,
                         rhs_path,
                         &display_options,
-                        graph_limit,
-                        byte_limit,
-                        language_override,
-                    )
-                    .for_each(|diff_result| {
-                        print_diff_result(&display_options, &diff_result);
-                    });
+                        &diff_options,
+                        &language_overrides,
+                    );
+
+                    if matches!(display_options.display_mode, DisplayMode::Json) {
+                        let results: Vec<_> = diff_iter.collect();
+                        encountered_changes = results
+                            .iter()
+                            .any(|diff_result| diff_result.has_reportable_change());
+                        display::json::print_directory(results, display_options.print_unchanged);
+                    } else if display_options.sort_paths {
+                        let mut result: Vec<DiffResult> = diff_iter.collect();
+                        result.sort_unstable_by(|a, b| a.display_path.cmp(&b.display_path));
+                        for diff_result in result {
+                            print_diff_result(&display_options, &diff_result);
+
+                            if diff_result.has_reportable_change() {
+                                encountered_changes = true;
+                            }
+                        }
+                    } else {
+                        // We want to diff files in the directory in
+                        // parallel, but print the results serially
+                        // (to prevent display interleaving).
+                        // https://github.com/rayon-rs/rayon/issues/210#issuecomment-551319338
+                        thread::scope(|s| {
+                            let (send, recv) = std::sync::mpsc::sync_channel(1);
+
+                            s.spawn(move || {
+                                diff_iter
+                                    .try_for_each_with(send, |s, diff_result| s.send(diff_result))
+                                    .expect("Receiver should be connected")
+                            });
+
+                            for diff_result in recv.into_iter() {
+                                print_diff_result(&display_options, &diff_result);
+
+                                if diff_result.has_reportable_change() {
+                                    encountered_changes = true;
+                                }
+                            }
+                        });
+                    }
                 }
                 _ => {
                     let diff_result = diff_file(
-                        &lhs_display_path,
-                        &rhs_display_path,
+                        &display_path,
+                        renamed,
                         &lhs_path,
                         &rhs_path,
+                        lhs_permissions.as_ref(),
+                        rhs_permissions.as_ref(),
                         &display_options,
-                        missing_as_empty,
-                        graph_limit,
-                        byte_limit,
-                        language_override,
+                        &diff_options,
+                        false,
+                        &language_overrides,
                     );
-                    print_diff_result(&display_options, &diff_result);
+                    if diff_result.has_reportable_change() {
+                        encountered_changes = true;
+                    }
+
+                    match display_options.display_mode {
+                        DisplayMode::Inline
+                        | DisplayMode::SideBySide
+                        | DisplayMode::SideBySideShowBoth => {
+                            print_diff_result(&display_options, &diff_result);
+                        }
+                        DisplayMode::Json => display::json::print(&diff_result),
+                    }
                 }
             }
+
+            let exit_code = if set_exit_code && encountered_changes {
+                EXIT_FOUND_CHANGES
+            } else {
+                EXIT_SUCCESS
+            };
+            std::process::exit(exit_code);
         }
     };
 }
 
-/// Return a copy of `str` with all the tab characters replaced by
-/// `tab_width` strings.
-///
-/// TODO: This break parsers that require tabs, such as Makefile
-/// parsing. We shouldn't do this transform until after parsing.
-fn replace_tabs(src: &str, tab_width: usize) -> String {
-    let tab_as_spaces = " ".repeat(tab_width);
-    src.replace('\t', &tab_as_spaces)
-}
-
 /// Print a diff between two files.
 fn diff_file(
-    lhs_display_path: &str,
-    rhs_display_path: &str,
+    display_path: &str,
+    renamed: Option<String>,
     lhs_path: &FileArgument,
     rhs_path: &FileArgument,
+    lhs_permissions: Option<&FilePermissions>,
+    rhs_permissions: Option<&FilePermissions>,
     display_options: &DisplayOptions,
+    diff_options: &DiffOptions,
     missing_as_empty: bool,
-    graph_limit: usize,
-    byte_limit: usize,
-    language_override: Option<parse::guess_language::Language>,
+    overrides: &[(LanguageOverride, Vec<glob::Pattern>)],
 ) -> DiffResult {
     let (lhs_bytes, rhs_bytes) = read_files_or_die(lhs_path, rhs_path, missing_as_empty);
-    diff_file_content(
-        lhs_display_path,
-        rhs_display_path,
-        lhs_path,
-        rhs_path,
-        &lhs_bytes,
-        &rhs_bytes,
-        display_options.tab_width,
-        graph_limit,
-        byte_limit,
-        language_override,
-    )
-}
-
-fn diff_file_content(
-    lhs_display_path: &str,
-    rhs_display_path: &str,
-    _lhs_path: &FileArgument,
-    rhs_path: &FileArgument,
-    lhs_bytes: &[u8],
-    rhs_bytes: &[u8],
-    tab_width: usize,
-    graph_limit: usize,
-    byte_limit: usize,
-    language_override: Option<parse::guess_language::Language>,
-) -> DiffResult {
-    let (mut lhs_src, mut rhs_src) = match (guess_content(lhs_bytes), guess_content(rhs_bytes)) {
+    let (mut lhs_src, mut rhs_src) = match (guess_content(&lhs_bytes), guess_content(&rhs_bytes)) {
         (ProbableFileKind::Binary, _) | (_, ProbableFileKind::Binary) => {
             return DiffResult {
-                lhs_display_path: lhs_display_path.into(),
-                rhs_display_path: rhs_display_path.into(),
-                language: None,
-                detected_language: None,
-                lhs_src: FileContent::Binary(lhs_bytes.to_vec()),
-                rhs_src: FileContent::Binary(rhs_bytes.to_vec()),
+                extra_info: renamed,
+                display_path: display_path.to_owned(),
+                file_format: FileFormat::Binary,
+                lhs_src: FileContent::Binary,
+                rhs_src: FileContent::Binary,
                 lhs_positions: vec![],
                 rhs_positions: vec![],
+                hunks: vec![],
+                has_byte_changes: lhs_bytes != rhs_bytes,
+                has_syntactic_changes: false,
             };
         }
         (ProbableFileKind::Text(lhs_src), ProbableFileKind::Text(rhs_src)) => (lhs_src, rhs_src),
     };
 
-    // TODO: don't replace tab characters inside string literals.
-    lhs_src = replace_tabs(&lhs_src, tab_width);
-    rhs_src = replace_tabs(&rhs_src, tab_width);
-
-    // Ignore the trailing newline, if present.
-    // TODO: highlight if this has changes (#144).
-    // TODO: factor out a string cleaning function.
-    if lhs_src.ends_with('\n') {
-        lhs_src.pop();
-    }
-    if rhs_src.ends_with('\n') {
-        rhs_src.pop();
+    if diff_options.strip_cr {
+        lhs_src.retain(|c| c != '\r');
+        rhs_src.retain(|c| c != '\r');
     }
 
-    let (guess_src, guess_path) = match rhs_path {
-        FileArgument::NamedPath(_) => (&rhs_src, Path::new(&rhs_display_path)),
-        FileArgument::Stdin => (&rhs_src, Path::new(&lhs_display_path)),
-        FileArgument::DevNull => (&lhs_src, Path::new(&lhs_display_path)),
+    // Ensure that lhs_src and rhs_src both have trailing
+    // newlines.
+    //
+    // This is important when textually diffing files that don't have
+    // a trailing newline, e.g. "foo\n\bar\n" versus "foo". We want to
+    // consider `foo` to be unchanged in this case.
+    //
+    // Theoretically a tree-sitter parser could change its AST due to
+    // the additional trailing newline, but it seems vanishingly
+    // unlikely.
+    if !lhs_src.is_empty() && !lhs_src.ends_with('\n') {
+        lhs_src.push('\n');
+    }
+    if !rhs_src.is_empty() && !rhs_src.ends_with('\n') {
+        rhs_src.push('\n');
+    }
+
+    let mut extra_info = renamed;
+    if let (Some(lhs_perms), Some(rhs_perms)) = (lhs_permissions, rhs_permissions) {
+        if lhs_perms != rhs_perms {
+            let msg = format!(
+                "File permissions changed from {} to {}.",
+                lhs_perms, rhs_perms
+            );
+
+            if let Some(extra_info) = &mut extra_info {
+                extra_info.push('\n');
+                extra_info.push_str(&msg);
+            } else {
+                extra_info = Some(msg);
+            }
+        }
+    }
+
+    diff_file_content(
+        display_path,
+        extra_info,
+        lhs_path,
+        rhs_path,
+        &lhs_src,
+        &rhs_src,
+        display_options,
+        diff_options,
+        overrides,
+    )
+}
+
+fn diff_conflicts_file(
+    display_path: &str,
+    path: &FileArgument,
+    display_options: &DisplayOptions,
+    diff_options: &DiffOptions,
+    overrides: &[(LanguageOverride, Vec<glob::Pattern>)],
+) -> DiffResult {
+    let bytes = read_file_or_die(path);
+    let mut src = match guess_content(&bytes) {
+        ProbableFileKind::Text(src) => src,
+        ProbableFileKind::Binary => {
+            eprintln!("error: Expected a text file with conflict markers, got a binary file.");
+            std::process::exit(EXIT_BAD_ARGUMENTS);
+        }
     };
 
-    let language = language_override.or_else(|| guess(guess_path, guess_src));
-    let lang_config = language.map(tsp::from_language);
+    if diff_options.strip_cr {
+        src.retain(|c| c != '\r');
+    }
 
-    if lhs_bytes == rhs_bytes {
-        // If the two files are completely identical, return early
+    let conflict_files = match apply_conflict_markers(&src) {
+        Ok(cf) => cf,
+        Err(msg) => {
+            eprintln!("error: {}", msg);
+            std::process::exit(EXIT_BAD_ARGUMENTS);
+        }
+    };
+
+    if conflict_files.num_conflicts == 0 {
+        eprintln!(
+            "error: Difftastic requires two paths, or a single file with conflict markers {}.\n",
+            START_LHS_MARKER,
+        );
+
+        eprintln!("USAGE:\n\n    {}\n", USAGE);
+        eprintln!("For more information try --help");
+        std::process::exit(EXIT_BAD_ARGUMENTS);
+    }
+
+    let lhs_name = match conflict_files.lhs_name {
+        Some(name) => format!("'{}'", name),
+        None => "the left file".to_owned(),
+    };
+    let rhs_name = match conflict_files.rhs_name {
+        Some(name) => format!("'{}'", name),
+        None => "the right file".to_owned(),
+    };
+
+    let extra_info = format!(
+        "Showing the result of replacing every conflict in {} with {}.",
+        lhs_name, rhs_name
+    );
+
+    diff_file_content(
+        display_path,
+        Some(extra_info),
+        path,
+        path,
+        &conflict_files.lhs_content,
+        &conflict_files.rhs_content,
+        display_options,
+        diff_options,
+        overrides,
+    )
+}
+
+fn check_only_text(
+    file_format: &FileFormat,
+    display_path: &str,
+    extra_info: Option<String>,
+    lhs_src: &str,
+    rhs_src: &str,
+) -> DiffResult {
+    let has_changes = lhs_src != rhs_src;
+
+    DiffResult {
+        display_path: display_path.to_owned(),
+        extra_info,
+        file_format: file_format.clone(),
+        lhs_src: FileContent::Text(lhs_src.into()),
+        rhs_src: FileContent::Text(rhs_src.into()),
+        lhs_positions: vec![],
+        rhs_positions: vec![],
+        hunks: vec![],
+        has_byte_changes: has_changes,
+        has_syntactic_changes: has_changes,
+    }
+}
+
+fn diff_file_content(
+    display_path: &str,
+    extra_info: Option<String>,
+    _lhs_path: &FileArgument,
+    rhs_path: &FileArgument,
+    lhs_src: &str,
+    rhs_src: &str,
+    display_options: &DisplayOptions,
+    diff_options: &DiffOptions,
+    overrides: &[(LanguageOverride, Vec<glob::Pattern>)],
+) -> DiffResult {
+    let guess_src = match rhs_path {
+        FileArgument::DevNull => &lhs_src,
+        _ => &rhs_src,
+    };
+
+    let language = guess(Path::new(display_path), guess_src, overrides);
+    let lang_config = language.map(|lang| (lang, tsp::from_language(lang)));
+
+    if lhs_src == rhs_src {
+        let file_format = match language {
+            Some(language) => FileFormat::SupportedLanguage(language),
+            None => FileFormat::PlainText,
+        };
+
+        // If the two files are byte-for-byte identical, return early
         // rather than doing any more work.
         return DiffResult {
-            lhs_display_path: lhs_display_path.into(),
-            rhs_display_path: rhs_display_path.into(),
-            language: language.map(|l| language_name(l).into()),
-            detected_language: language,
+            extra_info,
+            display_path: display_path.to_owned(),
+            file_format,
             lhs_src: FileContent::Text("".into()),
             rhs_src: FileContent::Text("".into()),
             lhs_positions: vec![],
             rhs_positions: vec![],
+            hunks: vec![],
+            has_byte_changes: false,
+            has_syntactic_changes: false,
         };
     }
 
-    let (lang_name, lhs_positions, rhs_positions) = match lang_config {
-        _ if lhs_bytes.len() > byte_limit || rhs_bytes.len() > byte_limit => {
-            let lhs_positions = line_parser::change_positions(&lhs_src, &rhs_src);
-            let rhs_positions = line_parser::change_positions(&rhs_src, &lhs_src);
-            (
-                Some("Text (exceeded DFT_BYTE_LIMIT)".into()),
-                lhs_positions,
-                rhs_positions,
-            )
+    let (file_format, lhs_positions, rhs_positions) = match lang_config {
+        None => {
+            let file_format = FileFormat::PlainText;
+            if diff_options.check_only {
+                return check_only_text(&file_format, display_path, extra_info, lhs_src, rhs_src);
+            }
+
+            let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+            let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+            (file_format, lhs_positions, rhs_positions)
         }
-        Some(ts_lang) => {
+        Some((language, lang_config)) => {
             let arena = Arena::new();
-            let lhs = tsp::parse(&arena, &lhs_src, &ts_lang);
-            let rhs = tsp::parse(&arena, &rhs_src, &ts_lang);
+            match tsp::to_tree_with_limit(diff_options, &lang_config, lhs_src, rhs_src) {
+                Ok((lhs_tree, rhs_tree)) => {
+                    match tsp::to_syntax_with_limit(
+                        lhs_src,
+                        rhs_src,
+                        &lhs_tree,
+                        &rhs_tree,
+                        &arena,
+                        &lang_config,
+                        diff_options,
+                    ) {
+                        Ok((lhs, rhs)) => {
+                            if diff_options.check_only {
+                                let has_syntactic_changes = lhs != rhs;
+                                return DiffResult {
+                                    extra_info,
+                                    display_path: display_path.to_owned(),
+                                    file_format: FileFormat::SupportedLanguage(language),
+                                    lhs_src: FileContent::Text(lhs_src.to_owned()),
+                                    rhs_src: FileContent::Text(rhs_src.to_owned()),
+                                    lhs_positions: vec![],
+                                    rhs_positions: vec![],
+                                    hunks: vec![],
+                                    has_byte_changes: true,
+                                    has_syntactic_changes,
+                                };
+                            }
 
-            init_all_info(&lhs, &rhs);
+                            let mut change_map = ChangeMap::default();
+                            let possibly_changed = if env::var("DFT_DBG_KEEP_UNCHANGED").is_ok() {
+                                vec![(lhs.clone(), rhs.clone())]
+                            } else {
+                                unchanged::mark_unchanged(&lhs, &rhs, &mut change_map)
+                            };
 
-            let mut change_map = ChangeMap::default();
-            let possibly_changed = if env::var("DFT_DBG_KEEP_UNCHANGED").is_ok() {
-                vec![(lhs.clone(), rhs.clone())]
-            } else {
-                unchanged::mark_unchanged(&lhs, &rhs, &mut change_map)
-            };
+                            let mut exceeded_graph_limit = false;
 
-            let mut exceeded_graph_limit = false;
+                            for (lhs_section_nodes, rhs_section_nodes) in possibly_changed {
+                                init_next_prev(&lhs_section_nodes);
+                                init_next_prev(&rhs_section_nodes);
 
-            for (lhs_section_nodes, rhs_section_nodes) in possibly_changed {
-                init_next_prev(&lhs_section_nodes);
-                init_next_prev(&rhs_section_nodes);
+                                match mark_syntax(
+                                    lhs_section_nodes.first().copied(),
+                                    rhs_section_nodes.first().copied(),
+                                    &mut change_map,
+                                    diff_options.graph_limit,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(ExceededGraphLimit {}) => {
+                                        exceeded_graph_limit = true;
+                                        break;
+                                    }
+                                }
+                            }
 
-                match mark_syntax(
-                    lhs_section_nodes.get(0).copied(),
-                    rhs_section_nodes.get(0).copied(),
-                    &mut change_map,
-                    graph_limit,
-                ) {
-                    Ok(()) => {}
-                    Err(ExceededGraphLimit {}) => {
-                        exceeded_graph_limit = true;
-                        break;
+                            if exceeded_graph_limit {
+                                let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+                                let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+                                (
+                                    FileFormat::TextFallback {
+                                        reason: "exceeded DFT_GRAPH_LIMIT".into(),
+                                    },
+                                    lhs_positions,
+                                    rhs_positions,
+                                )
+                            } else {
+                                fix_all_sliders(language, &lhs, &mut change_map);
+                                fix_all_sliders(language, &rhs, &mut change_map);
+
+                                let mut lhs_positions = syntax::change_positions(&lhs, &change_map);
+                                let mut rhs_positions = syntax::change_positions(&rhs, &change_map);
+
+                                if diff_options.ignore_comments {
+                                    let lhs_comments =
+                                        tsp::comment_positions(&lhs_tree, lhs_src, &lang_config);
+                                    lhs_positions.extend(lhs_comments);
+
+                                    let rhs_comments =
+                                        tsp::comment_positions(&rhs_tree, rhs_src, &lang_config);
+                                    rhs_positions.extend(rhs_comments);
+                                }
+
+                                (
+                                    FileFormat::SupportedLanguage(language),
+                                    lhs_positions,
+                                    rhs_positions,
+                                )
+                            }
+                        }
+                        Err(tsp::ExceededParseErrorLimit(error_count)) => {
+                            let file_format = FileFormat::TextFallback {
+                                reason: format!(
+                                    "{} {} parse error{}, exceeded DFT_PARSE_ERROR_LIMIT",
+                                    error_count,
+                                    language_name(language),
+                                    if error_count == 1 { "" } else { "s" }
+                                ),
+                            };
+
+                            if diff_options.check_only {
+                                return check_only_text(
+                                    &file_format,
+                                    display_path,
+                                    extra_info,
+                                    lhs_src,
+                                    rhs_src,
+                                );
+                            }
+
+                            let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+                            let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+                            (file_format, lhs_positions, rhs_positions)
+                        }
                     }
                 }
-            }
+                Err(tsp::ExceededByteLimit(num_bytes)) => {
+                    let file_format = FileFormat::TextFallback {
+                        reason: format!(
+                            "{} exceeded DFT_BYTE_LIMIT",
+                            &format_size(num_bytes, BINARY)
+                        ),
+                    };
 
-            if exceeded_graph_limit {
-                let lhs_positions = line_parser::change_positions(&lhs_src, &rhs_src);
-                let rhs_positions = line_parser::change_positions(&rhs_src, &lhs_src);
-                (
-                    Some("Text (exceeded DFT_GRAPH_LIMIT)".into()),
-                    lhs_positions,
-                    rhs_positions,
-                )
-            } else {
-                // TODO: Make this .expect() unnecessary.
-                let language =
-                    language.expect("If we had a ts_lang, we must have guessed the language");
-                fix_all_sliders(language, &lhs, &mut change_map);
-                fix_all_sliders(language, &rhs, &mut change_map);
+                    if diff_options.check_only {
+                        return check_only_text(
+                            &file_format,
+                            display_path,
+                            extra_info,
+                            lhs_src,
+                            rhs_src,
+                        );
+                    }
 
-                let lhs_positions = syntax::change_positions(&lhs, &change_map);
-                let rhs_positions = syntax::change_positions(&rhs, &change_map);
-                (
-                    Some(language_name(language).into()),
-                    lhs_positions,
-                    rhs_positions,
-                )
+                    let lhs_positions = line_parser::change_positions(lhs_src, rhs_src);
+                    let rhs_positions = line_parser::change_positions(rhs_src, lhs_src);
+                    (file_format, lhs_positions, rhs_positions)
+                }
             }
-        }
-        None => {
-            let lhs_positions = line_parser::change_positions(&lhs_src, &rhs_src);
-            let rhs_positions = line_parser::change_positions(&rhs_src, &lhs_src);
-            (None, lhs_positions, rhs_positions)
         }
     };
 
+    let opposite_to_lhs = opposite_positions(&lhs_positions);
+    let opposite_to_rhs = opposite_positions(&rhs_positions);
+
+    let hunks = matched_pos_to_hunks(&lhs_positions, &rhs_positions);
+    let hunks = merge_adjacent(
+        &hunks,
+        &opposite_to_lhs,
+        &opposite_to_rhs,
+        lhs_src.max_line(),
+        rhs_src.max_line(),
+        display_options.num_context_lines as usize,
+    );
+    let has_syntactic_changes = !hunks.is_empty();
+
     DiffResult {
-        lhs_display_path: lhs_display_path.into(),
-        rhs_display_path: rhs_display_path.into(),
-        language: lang_name,
-        detected_language: language,
-        lhs_src: FileContent::Text(lhs_src),
-        rhs_src: FileContent::Text(rhs_src),
+        extra_info,
+        display_path: display_path.to_owned(),
+        file_format,
+        lhs_src: FileContent::Text(lhs_src.to_owned()),
+        rhs_src: FileContent::Text(rhs_src.to_owned()),
         lhs_positions,
         rhs_positions,
+        hunks,
+        has_byte_changes: true,
+        has_syntactic_changes,
     }
 }
 
@@ -403,16 +763,17 @@ fn diff_file_content(
 /// incrementally.
 ///
 /// When more than one file is modified, the hg extdiff extension passes directory
-/// paths with the all the modified files.
+/// paths with all the modified files.
 fn diff_directories<'a>(
     lhs_dir: &'a Path,
     rhs_dir: &'a Path,
     display_options: &DisplayOptions,
-    graph_limit: usize,
-    byte_limit: usize,
-    language_override: Option<parse::guess_language::Language>,
+    diff_options: &DiffOptions,
+    overrides: &[(LanguageOverride, Vec<glob::Pattern>)],
 ) -> impl ParallelIterator<Item = DiffResult> + 'a {
+    let diff_options = diff_options.clone();
     let display_options = display_options.clone();
+    let overrides: Vec<_> = overrides.into();
 
     // We greedily list all files in the directory, and then diff them
     // in parallel. This is assuming that diffing is slower than
@@ -422,19 +783,20 @@ fn diff_directories<'a>(
     paths.into_par_iter().map(move |rel_path| {
         info!("Relative path is {:?} inside {:?}", rel_path, lhs_dir);
 
-        let lhs_path = Path::new(lhs_dir).join(&rel_path);
-        let rhs_path = Path::new(rhs_dir).join(&rel_path);
+        let lhs_path = FileArgument::NamedPath(Path::new(lhs_dir).join(&rel_path));
+        let rhs_path = FileArgument::NamedPath(Path::new(rhs_dir).join(&rel_path));
 
         diff_file(
-            &rel_path.to_string_lossy(),
-            &rel_path.to_string_lossy(),
-            &FileArgument::NamedPath(lhs_path),
-            &FileArgument::NamedPath(rhs_path),
+            &rel_path.display().to_string(),
+            None,
+            &lhs_path,
+            &rhs_path,
+            lhs_path.permissions().as_ref(),
+            rhs_path.permissions().as_ref(),
             &display_options,
+            &diff_options,
             true,
-            graph_limit,
-            byte_limit,
-            language_override,
+            &overrides,
         )
     })
 }
@@ -442,41 +804,57 @@ fn diff_directories<'a>(
 fn print_diff_result(display_options: &DisplayOptions, summary: &DiffResult) {
     match (&summary.lhs_src, &summary.rhs_src) {
         (FileContent::Text(lhs_src), FileContent::Text(rhs_src)) => {
-            let opposite_to_lhs = opposite_positions(&summary.lhs_positions);
-            let opposite_to_rhs = opposite_positions(&summary.rhs_positions);
+            let hunks = &summary.hunks;
 
-            let hunks = matched_pos_to_hunks(&summary.lhs_positions, &summary.rhs_positions);
-            let hunks = merge_adjacent(
-                &hunks,
-                &opposite_to_lhs,
-                &opposite_to_rhs,
-                lhs_src.max_line(),
-                rhs_src.max_line(),
-                display_options.num_context_lines as usize,
-            );
-
-            let lang_name = summary.language.clone().unwrap_or_else(|| "Text".into());
-            if hunks.is_empty() {
+            if !summary.has_syntactic_changes {
                 if display_options.print_unchanged {
                     println!(
                         "{}",
                         display::style::header(
-                            &summary.lhs_display_path,
-                            &summary.rhs_display_path,
+                            &summary.display_path,
+                            summary.extra_info.as_ref(),
                             1,
                             1,
-                            &lang_name,
+                            &summary.file_format,
                             display_options
                         )
                     );
-                    if lang_name == "Text" || summary.lhs_src == summary.rhs_src {
-                        // TODO: there are other Text names now, so
-                        // they will hit the second case incorrectly.
-                        println!("No changes.\n");
-                    } else {
-                        println!("No syntactic changes.\n");
+                    match summary.file_format {
+                        _ if summary.lhs_src == summary.rhs_src => {
+                            println!("No changes.\n");
+                        }
+                        FileFormat::SupportedLanguage(_) => {
+                            println!("No syntactic changes.\n");
+                        }
+                        _ => {
+                            println!("No changes.\n");
+                        }
                     }
                 }
+                return;
+            }
+
+            if summary.has_syntactic_changes && hunks.is_empty() {
+                println!(
+                    "{}",
+                    display::style::header(
+                        &summary.display_path,
+                        summary.extra_info.as_ref(),
+                        1,
+                        1,
+                        &summary.file_format,
+                        display_options
+                    )
+                );
+                match summary.file_format {
+                    FileFormat::SupportedLanguage(_) => {
+                        println!("Has syntactic changes.\n");
+                    }
+                    _ => {
+                        println!("Has changes.\n");
+                    }
+                }
+
                 return;
             }
 
@@ -488,64 +866,63 @@ fn print_diff_result(display_options: &DisplayOptions, summary: &DiffResult) {
                         display_options,
                         &summary.lhs_positions,
                         &summary.rhs_positions,
-                        &hunks,
-                        &summary.lhs_display_path,
-                        &summary.rhs_display_path,
-                        &lang_name,
-                        summary.detected_language,
+                        hunks,
+                        &summary.display_path,
+                        &summary.extra_info,
+                        &summary.file_format,
                     );
                 }
                 DisplayMode::SideBySide | DisplayMode::SideBySideShowBoth => {
                     display::side_by_side::print(
-                        &hunks,
+                        hunks,
                         display_options,
-                        &summary.lhs_display_path,
-                        &summary.rhs_display_path,
-                        &lang_name,
-                        summary.detected_language,
+                        &summary.display_path,
+                        summary.extra_info.as_ref(),
+                        &summary.file_format,
                         lhs_src,
                         rhs_src,
                         &summary.lhs_positions,
                         &summary.rhs_positions,
                     );
                 }
+                DisplayMode::Json => unreachable!(),
             }
         }
-        (FileContent::Binary(lhs_bytes), FileContent::Binary(rhs_bytes)) => {
-            let changed = lhs_bytes != rhs_bytes;
-            if display_options.print_unchanged || changed {
+        (FileContent::Binary, FileContent::Binary) => {
+            if display_options.print_unchanged || summary.has_byte_changes {
                 println!(
                     "{}",
                     display::style::header(
-                        &summary.lhs_display_path,
-                        &summary.rhs_display_path,
+                        &summary.display_path,
+                        summary.extra_info.as_ref(),
                         1,
                         1,
-                        "binary",
+                        &FileFormat::Binary,
                         display_options
                     )
                 );
-                if changed {
-                    println!("Binary contents changed.");
+                if summary.has_byte_changes {
+                    println!("Binary contents changed.\n");
                 } else {
-                    println!("No changes.");
+                    println!("No changes.\n");
                 }
             }
         }
-        (_, FileContent::Binary(_)) | (FileContent::Binary(_), _) => {
+        (FileContent::Text(_), FileContent::Binary)
+        | (FileContent::Binary, FileContent::Text(_)) => {
             // We're diffing a binary file against a text file.
             println!(
                 "{}",
                 display::style::header(
-                    &summary.lhs_display_path,
-                    &summary.rhs_display_path,
+                    &summary.display_path,
+                    summary.extra_info.as_ref(),
                     1,
                     1,
-                    "binary",
+                    &FileFormat::Binary,
                     display_options
                 )
             );
-            println!("Binary contents changed.");
+            println!("Binary contents changed.\n");
         }
     }
 }
@@ -555,22 +932,20 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
-    use crate::options::{DEFAULT_BYTE_LIMIT, DEFAULT_GRAPH_LIMIT, DEFAULT_TAB_WIDTH};
 
     #[test]
     fn test_diff_identical_content() {
         let s = "foo";
         let res = diff_file_content(
             "foo.el",
-            "foo.el",
-            &FileArgument::from_path_argument(OsStr::new("foo.el")),
-            &FileArgument::from_path_argument(OsStr::new("foo.el")),
-            s.as_bytes(),
-            s.as_bytes(),
-            DEFAULT_TAB_WIDTH,
-            DEFAULT_GRAPH_LIMIT,
-            DEFAULT_BYTE_LIMIT,
             None,
+            &FileArgument::from_path_argument(OsStr::new("foo.el")),
+            &FileArgument::from_path_argument(OsStr::new("foo.el")),
+            s,
+            s,
+            &DisplayOptions::default(),
+            &DiffOptions::default(),
+            &[],
         );
 
         assert_eq!(res.lhs_positions, vec![]);
