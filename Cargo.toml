@@ -4,57 +4,115 @@ description = "A structural diff that understands syntax."
 repository = "https://github.com/wilfred/difftastic"
 homepage = "http://difftastic.wilfred.me.uk/"
 license = "MIT"
-version = "0.38.0"
+version = "0.63.0"
 authors = ["Wilfred Hughes <me@wilfred.me.uk>"]
 keywords = ["diff", "syntax"]
 categories = ["development-tools", "command-line-utilities", "parser-implementations"]
-edition = "2018"
-rust-version = "1.57.0"
+edition = "2021"
+# Goal: support at least 12 months of Rust versions, and be
+# conservative about upgrades to help packagers.
+#
+# For reference, Debian stable is on 1.63 (see
+# https://tracker.debian.org/pkg/rustc) but Debian doesn't currently
+# package difftastic. Other distros are somewhat newer.
+rust-version = "1.74.1"
 include = [
         "/build.rs",
         "/src/",
-        "/vendor/highlights/*.scm",
-        "/vendor/*-src/**/*.c",
-        "/vendor/*-src/**/*.h",
-        "/vendor/*-src/**/*.cc",
+        "/vendored_parsers/highlights/*.scm",
+        "/vendored_parsers/*-src/**/*.c",
+        "/vendored_parsers/*-src/**/*.h",
+        "/vendored_parsers/*-src/**/*.cc",
+        "/LICENSE",
         "/README.md",
 ]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ version }/difft-{ target }.{ archive-format }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dependencies]
-regex = "1.5.4"
-clap = { version = "3.1.8", features = ["cargo", "env", "wrap_help"] }
-itertools = "0.10.1"
-typed-arena = "2.0.1"
-rustc-hash = "1.1.0"
+regex = "1.10.4"
+clap = { version = "4.0.0", features = ["cargo", "env", "wrap_help", "string"] }
+itertools = "0.11.0"
+typed-arena = "2.0.2"
+rustc-hash = "2.0.0"
 strsim = "0.10.0"
 lazy_static = "1.4.0"
-atty = "0.2.14"
-tree-sitter = "0.20.9"
+tree-sitter = "0.24.0"
 libc = "0.2.108"
 log = "0.4.14"
-pretty_env_logger = "0.4.0"
+pretty_env_logger = "0.5.0"
+
 mimalloc = { version = "0.1.28", default-features = false }
 # Pin libmimalloc-sys due to 0.1.25 producing a huge slowdown in very
 # large textual files, as discussed in #297.
 libmimalloc-sys = "=0.1.24"
 radix-heap = "0.4.2"
-walkdir = "2.3.2"
-terminal_size = "0.2.1"
-const_format = "0.2.22"
-owo-colors = "3.3.0"
+# ignore does not declare a MSRV, but it's part of ripgrep, which has
+# a slightly more aggressive MSRV than difftastic. Constrain ignore to
+# a known-good max version.
+ignore = ">= 0.4, < 0.4.24"
+owo-colors = "3.5.0"
 wu-diff = "0.1.2"
-rayon = "1.5.2"
-tree_magic_mini = "3.0.2"
-bumpalo = "3.9.1"
+rayon = "1.7.0"
+tree_magic_mini = "3.1.5"
+
+bumpalo = "3.16.0"
 unicode-width = "0.1.9"
-term_size = "0.3.2"
+crossterm = { version = "0.28.0", features = ["windows"] }
+glob = "0.3.1"
+strum = { version = "0.26", features = ["derive"] }
+hashbrown = "0.14.0"
+humansize = "2.1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+line-numbers = "0.3.0"
+smallvec = "1.13.2"
+tree-sitter-language = "0.1.3"
+streaming-iterator = "0.1.9"
+tree-sitter-haskell = "0.23.1"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-scala = "0.23.3"
+tree-sitter-objc = "3.0.2"
+tree-sitter-ocaml = "0.23.2"
+tree-sitter-c-sharp = "0.23.1"
+tree-sitter-python = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c = "0.23.4"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-java = "0.23.4"
+tree-sitter-julia = "0.23.1"
+tree-sitter-go = "0.23.4"
+tree-sitter-bash = "0.23.3"
+tree-sitter-php = "0.23.11"
+tree-sitter-json = "0.24.8"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.23.1"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-lua = "0.2.0"
+tree-sitter-xml = "0.7.0"
+tree-sitter-make = "1.1.1"
+tree-sitter-yaml = "0.7.0"
+encoding_rs = "0.8.35"
+tree-sitter-rust = "0.23.2"
 
 [dev-dependencies]
-pretty_assertions = "1.2.1"
+# assert_cmd 2.0.10 requires predicates 3.
+# TODO: update.
+assert_cmd = ">= 2, < 2.0.9"
+predicates = "2.1.0"
+
+pretty_assertions = "1.3.0"
 
 [build-dependencies]
-cc = "1.0.73"
-rayon = "1.5.2"
+# TODO: enable parallel mode once MSRV hits 1.61, see discussion in
+# https://github.com/rust-lang/cc-rs/pull/849
+cc = "1.1.30"
+rayon = "1.7.0"
 version_check = "0.9.4"
 
 [profile.release]
@@ -65,7 +123,3 @@ name = "difft"
 path = "src/main.rs"
 
 [features]
-
-[patch.crates-io]
-# https://github.com/mbrubeck/tree_magic/pull/13 hasn't been merged yet.
-tree_magic_mini = { git = 'https://github.com/Wilfred/tree_magic', branch = 'fix-panic-for-empty-strings' }

@@ -1,16 +1,16 @@
 //! A fallback "parser" for plain text.
 
-use std::hash::Hash;
-
 use lazy_static::lazy_static;
+use line_numbers::{LinePositions, SingleLineSpan};
 use regex::Regex;
-use rustc_hash::FxHashMap;
 
+use crate::words::split_words;
 use crate::{
     diff::myers_diff,
-    lines::NewlinePositions,
-    parse::syntax::{split_words, AtomKind, MatchKind, MatchedPos, TokenKind},
+    parse::syntax::{AtomKind, MatchKind, MatchedPos, TokenKind},
 };
+
+const MAX_WORDS_IN_LINE: usize = 1000;
 
 fn split_lines_keep_newline(s: &str) -> Vec<&str> {
     lazy_static! {
@@ -18,17 +18,17 @@ fn split_lines_keep_newline(s: &str) -> Vec<&str> {
     }
 
     let mut offset = 0;
-    let mut res = vec![];
+    let mut lines = vec![];
     for newline_match in NEWLINE_RE.find_iter(s) {
-        res.push(s[offset..newline_match.end()].into());
+        lines.push(s[offset..newline_match.end()].into());
         offset = newline_match.end();
     }
 
     if offset < s.len() {
-        res.push(s[offset..].into());
+        lines.push(s[offset..].into());
     }
 
-    res
+    lines
 }
 
 #[derive(Debug)]
@@ -73,63 +73,6 @@ fn merge_novel<'a>(
     res
 }
 
-/// Compute a unique numeric value for each item, use that for
-/// diffing, then return diff results in terms of the original type.
-///
-/// This is the decorate-sort-undecorate pattern, or Schwartzian
-/// transform, for diffing.
-fn diff_slice_by_hash<'a, T: Eq + Hash>(
-    lhs: &'a [T],
-    rhs: &'a [T],
-) -> Vec<myers_diff::DiffResult<&'a T>> {
-    let mut value_ids: FxHashMap<&T, u32> = FxHashMap::default();
-    let mut id_values: FxHashMap<u32, &T> = FxHashMap::default();
-
-    let mut lhs_ids = Vec::with_capacity(lhs.len());
-    for value in lhs {
-        let id: u32 = match value_ids.get(value) {
-            Some(id) => *id,
-            None => {
-                let new_id = value_ids.len() as u32;
-                value_ids.insert(value, new_id);
-                id_values.insert(new_id, value);
-                new_id
-            }
-        };
-        lhs_ids.push(id);
-    }
-
-    let mut rhs_ids = Vec::with_capacity(rhs.len());
-    for value in rhs {
-        let id = match value_ids.get(value) {
-            Some(id) => *id,
-            None => {
-                let new_id = value_ids.len() as u32;
-                value_ids.insert(value, new_id);
-                id_values.insert(new_id, value);
-                new_id
-            }
-        };
-        rhs_ids.push(id);
-    }
-
-    myers_diff::slice(&lhs_ids[..], &rhs_ids[..])
-        .into_iter()
-        .map(|result| match result {
-            myers_diff::DiffResult::Left(id) => {
-                myers_diff::DiffResult::Left(*id_values.get(id).unwrap())
-            }
-            myers_diff::DiffResult::Both(lhs_id, rhs_id) => myers_diff::DiffResult::Both(
-                *id_values.get(lhs_id).unwrap(),
-                *id_values.get(rhs_id).unwrap(),
-            ),
-            myers_diff::DiffResult::Right(id) => {
-                myers_diff::DiffResult::Right(*id_values.get(id).unwrap())
-            }
-        })
-        .collect::<Vec<_>>()
-}
-
 fn changed_parts<'a>(
     src: &'a str,
     opposite_src: &'a str,
@@ -138,7 +81,7 @@ fn changed_parts<'a>(
     let opposite_src_lines = split_lines_keep_newline(opposite_src);
 
     let mut res: Vec<(TextChangeKind, Vec<&'a str>, Vec<&'a str>)> = vec![];
-    for diff_res in diff_slice_by_hash(&src_lines, &opposite_src_lines) {
+    for diff_res in myers_diff::slice_unique_by_hash(&src_lines, &opposite_src_lines) {
         match diff_res {
             myers_diff::DiffResult::Left(line) => {
                 res.push((TextChangeKind::Novel, vec![line], vec![]));
@@ -164,27 +107,35 @@ fn line_len_in_bytes(line: &str) -> usize {
     }
 }
 
-// TODO: Prefer src/opposite_src nomenclature as this function is called from both sides.
-pub fn change_positions(lhs_src: &str, rhs_src: &str) -> Vec<MatchedPos> {
+/// Build a vec of MatchedPos, performing a textual diff. Match up
+/// unchanged lines, and match up unchanged words within novel lines.
+///
+/// The resulting vec only has novel items from the LHS. Callers
+/// should do `change_positions(rhs_src, lhs_src)` to obtain
+/// novel MatchedPos values for the RHS.
+pub(crate) fn change_positions(lhs_src: &str, rhs_src: &str) -> Vec<MatchedPos> {
     // TODO: If either side is "", don't split each line by words
     // pointlessly. This is common for file additions/removals.
-    let lhs_nlp = NewlinePositions::from(lhs_src);
-    let rhs_nlp = NewlinePositions::from(rhs_src);
+    let lhs_lp = LinePositions::from(lhs_src);
+    let rhs_lp = LinePositions::from(rhs_src);
 
     let mut lhs_offset = 0;
     let mut rhs_offset = 0;
 
-    let mut res = vec![];
+    let mut mps = vec![];
+
+    let mut seen_unchanged = false;
     for (kind, lhs_lines, rhs_lines) in changed_parts(lhs_src, rhs_src) {
         match kind {
             TextChangeKind::Unchanged => {
+                seen_unchanged = true;
                 for (lhs_line, rhs_line) in lhs_lines.iter().zip(rhs_lines) {
                     let lhs_pos =
-                        lhs_nlp.from_offsets(lhs_offset, lhs_offset + line_len_in_bytes(lhs_line));
+                        lhs_lp.from_region(lhs_offset, lhs_offset + line_len_in_bytes(lhs_line));
                     let rhs_pos =
-                        rhs_nlp.from_offsets(rhs_offset, rhs_offset + line_len_in_bytes(rhs_line));
+                        rhs_lp.from_region(rhs_offset, rhs_offset + line_len_in_bytes(rhs_line));
 
-                    res.push(MatchedPos {
+                    mps.push(MatchedPos {
                         kind: MatchKind::UnchangedToken {
                             highlight: TokenKind::Atom(AtomKind::Normal),
                             self_pos: lhs_pos.clone(),
@@ -201,32 +152,54 @@ pub fn change_positions(lhs_src: &str, rhs_src: &str) -> Vec<MatchedPos> {
                 let lhs_part = lhs_lines.join("");
                 let rhs_part = rhs_lines.join("");
 
-                for diff_res in myers_diff::slice(&split_words(&lhs_part), &split_words(&rhs_part))
-                {
+                let lhs_words = split_words(&lhs_part);
+                let rhs_words = split_words(&rhs_part);
+
+                // Myers Diff scales badly on large inputs, and
+                // word-level diffing is merely nice to have. If we
+                // have a very large number of words, don't diff
+                // individual words.
+                if lhs_words.len() > MAX_WORDS_IN_LINE || rhs_words.len() > MAX_WORDS_IN_LINE {
+                    for lhs_pos in lhs_lp.from_region(lhs_offset, lhs_offset + lhs_part.len()) {
+                        if lhs_pos.start_col != lhs_pos.end_col {
+                            mps.push(MatchedPos {
+                                kind: MatchKind::NovelWord {
+                                    highlight: TokenKind::Atom(AtomKind::Normal),
+                                },
+                                pos: lhs_pos,
+                            });
+                        }
+                    }
+
+                    lhs_offset += lhs_part.len();
+                    rhs_offset += rhs_part.len();
+                    continue;
+                }
+
+                for diff_res in myers_diff::slice_unique_by_hash(&lhs_words, &rhs_words) {
                     match diff_res {
                         myers_diff::DiffResult::Left(lhs_word) => {
-                            if *lhs_word != "\n" {
-                                let lhs_pos =
-                                    lhs_nlp.from_offsets(lhs_offset, lhs_offset + lhs_word.len());
-                                res.push(MatchedPos {
-                                    kind: MatchKind::NovelWord {
-                                        highlight: TokenKind::Atom(AtomKind::Normal),
-                                    },
-                                    pos: lhs_pos[0],
-                                });
-                            }
+                            let lhs_pos =
+                                lhs_lp.from_region(lhs_offset, lhs_offset + lhs_word.len());
+
+                            mps.push(MatchedPos {
+                                kind: MatchKind::NovelWord {
+                                    highlight: TokenKind::Atom(AtomKind::Normal),
+                                },
+                                pos: lhs_pos[0],
+                            });
 
                             lhs_offset += lhs_word.len();
                         }
                         myers_diff::DiffResult::Both(lhs_word, rhs_word) => {
                             if *lhs_word != "\n" {
                                 let lhs_pos =
-                                    lhs_nlp.from_offsets(lhs_offset, lhs_offset + lhs_word.len());
+                                    lhs_lp.from_region(lhs_offset, lhs_offset + lhs_word.len());
                                 let rhs_pos =
-                                    rhs_nlp.from_offsets(rhs_offset, rhs_offset + rhs_word.len());
+                                    rhs_lp.from_region(rhs_offset, rhs_offset + rhs_word.len());
 
-                                res.push(MatchedPos {
-                                    kind: MatchKind::NovelLinePart {
+                                mps.push(MatchedPos {
+                                    kind: MatchKind::UnchangedPartOfNovelItem {
                                         highlight: TokenKind::Atom(AtomKind::Normal),
                                         self_pos: lhs_pos[0],
                                         opposite_pos: rhs_pos,
@@ -247,15 +220,42 @@ pub fn change_positions(lhs_src: &str, rhs_src: &str) -> Vec<MatchedPos> {
         }
     }
 
-    res
+    // If there are no unchanged items, insert a dummy item at the
+    // beginning of both files with a width of zero. This gives
+    // display something to use when aligning.
+    if !seen_unchanged {
+        let lhs_pos = SingleLineSpan {
+            line: 0.into(),
+            start_col: 0,
+            end_col: 0,
+        };
+        let rhs_pos = SingleLineSpan {
+            line: 0.into(),
+            start_col: 0,
+            end_col: 0,
+        };
+        mps.insert(
+            0,
+            MatchedPos {
+                kind: MatchKind::UnchangedToken {
+                    highlight: TokenKind::Atom(AtomKind::Normal),
+                    self_pos: vec![lhs_pos],
+                    opposite_pos: vec![rhs_pos],
+                },
+                pos: lhs_pos,
+            },
+        );
+    }
+
+    mps
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::positions::SingleLineSpan;
+    use line_numbers::SingleLineSpan;
+    use pretty_assertions::assert_eq;
 
     use super::*;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_split_newlines() {
@@ -285,8 +285,9 @@ mod tests {
         // Even though the word exists on both sides, it should still
         // be treated as a change. We're doing a line-based diff and
         // the lines are different.
-        let positions = change_positions("foo", " foo");
-        assert!(positions[0].kind.is_novel());
+        let mut positions = change_positions("foo", " foo");
+        let last_pos = positions.pop().unwrap();
+        assert!(last_pos.kind.is_novel());
     }
 
     #[test]
@@ -307,17 +308,17 @@ mod tests {
 
     #[test]
     fn test_novel_lhs_trailing_newlines() {
-        let positions = change_positions("foo\n", "");
+        let mut positions = change_positions("foo\n", "");
 
-        assert_eq!(positions.len(), 1);
-        assert!(positions[0].kind.is_novel());
+        let last_pos = positions.pop().unwrap();
+        assert!(last_pos.kind.is_novel());
     }
 
     #[test]
     fn test_positions_novel_lhs() {
-        let positions = change_positions("foo", "");
+        let mut positions = change_positions("foo", "");
 
-        assert_eq!(positions.len(), 1);
-        assert!(positions[0].kind.is_novel());
+        let last_pos = positions.pop().unwrap();
+        assert!(last_pos.kind.is_novel());
     }
 }

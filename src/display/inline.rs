@@ -2,25 +2,27 @@
 
 use crate::{
     constants::Side,
-    display::context::{calculate_after_context, calculate_before_context, opposite_positions},
-    display::hunks::Hunk,
-    display::style::{self, apply_colors, apply_line_number_color},
+    display::{
+        context::{calculate_after_context, calculate_before_context, opposite_positions},
+        hunks::Hunk,
+        style::{self, apply_colors, apply_line_number_color},
+    },
     lines::{format_line_num, split_on_newlines, MaxLine},
     options::DisplayOptions,
-    parse::{guess_language::Language, syntax::MatchedPos},
+    parse::syntax::MatchedPos,
+    summary::FileFormat,
 };
 
-pub fn print(
+pub(crate) fn print(
     lhs_src: &str,
     rhs_src: &str,
     display_options: &DisplayOptions,
     lhs_positions: &[MatchedPos],
     rhs_positions: &[MatchedPos],
     hunks: &[Hunk],
-    lhs_display_path: &str,
-    rhs_display_path: &str,
-    lang_name: &str,
-    language: Option<Language>,
+    display_path: &str,
+    extra_info: &Option<String>,
+    file_format: &FileFormat,
 ) {
     let (lhs_colored_lines, rhs_colored_lines) = if display_options.use_color {
         (
@@ -28,7 +30,7 @@ pub fn print(
                 lhs_src,
                 Side::Left,
                 display_options.syntax_highlight,
-                language,
+                file_format,
                 display_options.background_color,
                 lhs_positions,
             ),
@@ -36,7 +38,7 @@ pub fn print(
                 rhs_src,
                 Side::Right,
                 display_options.syntax_highlight,
-                language,
+                file_format,
                 display_options.background_color,
                 rhs_positions,
             ),
@@ -44,15 +46,22 @@ pub fn print(
     } else {
         (
             split_on_newlines(lhs_src)
-                .iter()
                 .map(|s| format!("{}\n", s))
                 .collect(),
             split_on_newlines(rhs_src)
-                .iter()
                 .map(|s| format!("{}\n", s))
                 .collect(),
         )
     };
+
+    let lhs_colored_lines: Vec<_> = lhs_colored_lines
+        .into_iter()
+        .map(|line| style::replace_tabs(&line, display_options.tab_width))
+        .collect();
+    let rhs_colored_lines: Vec<_> = rhs_colored_lines
+        .into_iter()
+        .map(|line| style::replace_tabs(&line, display_options.tab_width))
+        .collect();
 
     let opposite_to_lhs = opposite_positions(lhs_positions);
     let opposite_to_rhs = opposite_positions(rhs_positions);
@@ -61,11 +70,11 @@ pub fn print(
         println!(
             "{}",
             style::header(
-                lhs_display_path,
-                rhs_display_path,
+                display_path,
+                extra_info.as_ref(),
                 i + 1,
                 hunks.len(),
-                lang_name,
+                file_format,
                 display_options
             )
         );

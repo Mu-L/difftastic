@@ -1,52 +1,54 @@
-use std::rc::Rc;
+use bumpalo::Bump;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Node<T> {
+struct Node<'b, T> {
     val: T,
-    next: Option<Rc<Node<T>>>,
+    next: Option<&'b Node<'b, T>>,
 }
 
+/// A persistent stack.
+///
+/// This is similar to `Stack` from the rpds crate, but it's faster
+/// and uses less memory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Stack<T> {
-    head: Option<Rc<Node<T>>>,
+pub(crate) struct Stack<'b, T> {
+    head: Option<&'b Node<'b, T>>,
 }
 
-impl<T> Stack<T> {
-    pub fn new() -> Self {
+impl<'b, T> Stack<'b, T> {
+    pub(crate) fn new() -> Self {
         Self { head: None }
     }
 
-    pub fn peek(&self) -> Option<&T> {
-        self.head.as_deref().map(|n| &n.val)
+    pub(crate) fn peek(&self) -> Option<&T> {
+        self.head.map(|n| &n.val)
     }
 
-    pub fn pop(&self) -> Option<Stack<T>> {
-        self.head.as_deref().map(|n| Self {
-            head: n.next.clone(),
-        })
+    pub(crate) fn pop(&self) -> Option<Stack<'b, T>> {
+        self.head.map(|n| Self { head: n.next })
     }
 
-    pub fn push(&self, v: T) -> Stack<T> {
+    pub(crate) fn push(&self, v: T, alloc: &'b Bump) -> Stack<'b, T> {
         Self {
-            head: Some(Rc::new(Node {
+            head: Some(alloc.alloc(Node {
                 val: v,
-                next: self.head.clone(),
+                next: self.head,
             })),
         }
     }
 
     // O(n)
-    pub fn size(&self) -> usize {
-        let mut res = 0;
+    pub(crate) fn size(&self) -> usize {
+        let mut count = 0;
         let mut node = &self.head;
         while let Some(next) = node {
-            res += 1;
+            count += 1;
             node = &next.next;
         }
-        res
+        count
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.head.is_none()
     }
 }

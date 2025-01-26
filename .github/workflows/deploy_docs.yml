@@ -6,23 +6,34 @@ on:
       - master
 
 jobs:
-  deploy:
+  pre_deploy:
     runs-on: ubuntu-20.04
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
-      - uses: actions/checkout@v3
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: always
+
+  deploy:
+    needs: pre_deploy
+    if: needs.pre_deploy.outputs.should_skip != 'true'
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install jq
         run: sudo apt-get install -y jq
 
-      - uses: dtolnay/rust-toolchain@1.57.0
+      - uses: dtolnay/rust-toolchain@1.66.0
       - run: cargo doc
 
       - name: Setup mdBook
-        uses: peaceiris/actions-mdbook@v1
+        uses: peaceiris/actions-mdbook@v2
         with:
-          mdbook-version: '0.4.18'
+          mdbook-version: '0.4.40'
 
       - name: Build manual
         run: mdbook build
@@ -38,8 +49,11 @@ jobs:
       - name: Add translated manual output
         run: cp -r translation/zh-CN/manual-zh-CN/book manual/book/zh-CN
 
+      - name: Add homepage
+        run: cp -r homepage/* manual/book/
+
       - name: Deploy to GitHub pages
-        uses: JamesIves/github-pages-deploy-action@v4.4.0
+        uses: JamesIves/github-pages-deploy-action@v4.6.4
         with:
           branch: gh-pages
           folder: manual/book

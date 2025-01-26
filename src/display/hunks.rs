@@ -7,31 +7,31 @@ const MAX_DISTANCE: u32 = 4;
 
 use std::collections::HashSet;
 
-use rustc_hash::FxHashMap;
+use line_numbers::LineNumber;
 
 use crate::{
     constants::Side,
     display::context::{add_context, opposite_positions},
     display::side_by_side::lines_with_novel,
-    lines::LineNumber,
-    parse::syntax::{zip_pad_shorter, MatchedPos},
+    hash::DftHashMap,
+    parse::syntax::{zip_pad_shorter, MatchKind, MatchedPos},
 };
 
 /// A hunk represents a series of modified lines that are displayed
 /// together.
 #[derive(Debug, Clone)]
-pub struct Hunk {
+pub(crate) struct Hunk {
     /// The LHS line numbers that contain novel content.
-    pub novel_lhs: HashSet<LineNumber>,
+    pub(crate) novel_lhs: HashSet<LineNumber>,
     /// The RHS line numbers that contain novel content.
-    pub novel_rhs: HashSet<LineNumber>,
+    pub(crate) novel_rhs: HashSet<LineNumber>,
     /// Line pairs that contain modified lines. This does not include
     /// padding, so at least one of the two lines has novel content.
-    pub lines: Vec<(Option<LineNumber>, Option<LineNumber>)>,
+    pub(crate) lines: Vec<(Option<LineNumber>, Option<LineNumber>)>,
 }
 
 impl Hunk {
-    pub fn merge(self, other: &Self) -> Self {
+    pub(crate) fn merge(self, other: &Self) -> Self {
         let mut lines = self.lines;
         lines.extend(other.lines.iter());
 
@@ -130,15 +130,15 @@ fn extract_lines(hunk: &Hunk) -> Vec<(Option<LineNumber>, Option<LineNumber>)> {
     relevant
 }
 
-pub fn merge_adjacent(
+pub(crate) fn merge_adjacent(
     hunks: &[Hunk],
-    opposite_to_lhs: &FxHashMap<LineNumber, HashSet<LineNumber>>,
-    opposite_to_rhs: &FxHashMap<LineNumber, HashSet<LineNumber>>,
+    opposite_to_lhs: &DftHashMap<LineNumber, HashSet<LineNumber>>,
+    opposite_to_rhs: &DftHashMap<LineNumber, HashSet<LineNumber>>,
     max_lhs_src_line: LineNumber,
     max_rhs_src_line: LineNumber,
     num_context_lines: usize,
 ) -> Vec<Hunk> {
-    let mut res: Vec<Hunk> = vec![];
+    let mut merged_hunks: Vec<Hunk> = vec![];
     let mut prev_hunk: Option<Hunk> = None;
 
     let mut prev_lhs_lines: HashSet<LineNumber> = HashSet::new();
@@ -171,7 +171,7 @@ pub fn merge_adjacent(
                 if lhs_lines.is_disjoint(&prev_lhs_lines) && rhs_lines.is_disjoint(&prev_rhs_lines)
                 {
                     // No overlaps, start a new hunk.
-                    res.push(hunk_so_far.clone());
+                    merged_hunks.push(hunk_so_far.clone());
                     prev_hunk = Some(hunk.clone());
 
                     prev_lhs_lines = lhs_lines;
@@ -193,10 +193,10 @@ pub fn merge_adjacent(
     }
 
     if let Some(current_hunk) = prev_hunk {
-        res.push(current_hunk);
+        merged_hunks.push(current_hunk);
     }
 
-    res
+    merged_hunks
 }
 
 fn lines_are_close(
@@ -227,7 +227,7 @@ fn lines_are_close(
 fn enforce_increasing(
     lines: &[(Option<LineNumber>, Option<LineNumber>)],
 ) -> Vec<(Option<LineNumber>, Option<LineNumber>)> {
-    let mut res = vec![];
+    let mut ordered_lines = vec![];
 
     let mut max_lhs_line: Option<LineNumber> = None;
     let mut max_rhs_line: Option<LineNumber> = None;
@@ -264,11 +264,11 @@ fn enforce_increasing(
         }
 
         if lhs_line.is_some() || rhs_line.is_some() {
-            res.push((lhs_line, rhs_line));
+            ordered_lines.push((lhs_line, rhs_line));
         }
     }
 
-    res
+    ordered_lines
 }
 
 fn find_novel_lines(
@@ -364,8 +364,8 @@ fn novel_section_in_order(
     rhs_novel_mps: &[&MatchedPos],
     lhs_prev_matched_line: Option<LineNumber>,
     rhs_prev_matched_line: Option<LineNumber>,
-    opposite_to_lhs: &FxHashMap<LineNumber, HashSet<LineNumber>>,
-    opposite_to_rhs: &FxHashMap<LineNumber, HashSet<LineNumber>>,
+    opposite_to_lhs: &DftHashMap<LineNumber, HashSet<LineNumber>>,
+    opposite_to_rhs: &DftHashMap<LineNumber, HashSet<LineNumber>>,
 ) -> Vec<(Side, MatchedPos)> {
     let mut res: Vec<(Side, MatchedPos)> = vec![];
 
@@ -439,8 +439,8 @@ fn novel_section_in_order(
 fn sorted_novel_positions(
     lhs_mps: &[MatchedPos],
     rhs_mps: &[MatchedPos],
-    opposite_to_lhs: &FxHashMap<LineNumber, HashSet<LineNumber>>,
-    opposite_to_rhs: &FxHashMap<LineNumber, HashSet<LineNumber>>,
+    opposite_to_lhs: &DftHashMap<LineNumber, HashSet<LineNumber>>,
+    opposite_to_rhs: &DftHashMap<LineNumber, HashSet<LineNumber>>,
 ) -> Vec<(Side, MatchedPos)> {
     let mut lhs_mps: Vec<MatchedPos> = lhs_mps.to_vec();
     lhs_mps.sort_unstable_by_key(|mp| mp.pos);
@@ -459,6 +459,32 @@ fn sorted_novel_positions(
     let mut rhs_iter = rhs_mps.iter().peekable();
     loop {
         match (lhs_iter.peek(), rhs_iter.peek()) {
+            (
+                Some(MatchedPos {
+                    kind: MatchKind::Ignored { .. },
+                    ..
+                }),
+                _,
+            ) => {
+                // Ignored nodes shouldn't be treated as novel,
+                // because we don't want to create hunks if we see
+                // them. However, they don't have corresponding
+                // positions on the other side, so just skip.
+                lhs_iter.next();
+            }
+            (
+                _,
+                Some(MatchedPos {
+                    kind: MatchKind::Ignored { .. },
+                    ..
+                }),
+            ) => {
+                // Ignored nodes shouldn't be treated as novel,
+                // because we don't want to create hunks if we see
+                // them. However, they don't have corresponding
+                // positions on the other side, so just skip.
+                rhs_iter.next();
+            }
             (Some(lhs_mp), Some(rhs_mp)) if !lhs_mp.kind.is_novel() && !rhs_mp.kind.is_novel() => {
                 res.append(&mut novel_section_in_order(
                     &lhs_novel_section,
@@ -507,7 +533,7 @@ fn sorted_novel_positions(
 
 fn next_opposite(
     line: LineNumber,
-    opposites: &FxHashMap<LineNumber, HashSet<LineNumber>>,
+    opposites: &DftHashMap<LineNumber, HashSet<LineNumber>>,
     prev_opposite: Option<LineNumber>,
 ) -> Option<LineNumber> {
     opposites.get(&line).and_then(|lines_set| {
@@ -573,7 +599,7 @@ fn matched_novel_lines(
     lines
 }
 
-pub fn matched_pos_to_hunks(lhs_mps: &[MatchedPos], rhs_mps: &[MatchedPos]) -> Vec<Hunk> {
+pub(crate) fn matched_pos_to_hunks(lhs_mps: &[MatchedPos], rhs_mps: &[MatchedPos]) -> Vec<Hunk> {
     lines_to_hunks(&matched_novel_lines(lhs_mps, rhs_mps), lhs_mps, rhs_mps)
 }
 
@@ -597,7 +623,7 @@ fn either_side_equal(
     false
 }
 
-pub fn matched_lines_indexes_for_hunk(
+pub(crate) fn matched_lines_indexes_for_hunk(
     matched_lines: &[(Option<LineNumber>, Option<LineNumber>)],
     hunk: &Hunk,
     num_context_lines: usize,
@@ -655,12 +681,14 @@ pub fn matched_lines_indexes_for_hunk(
 mod tests {
     use std::iter::FromIterator;
 
+    use line_numbers::SingleLineSpan;
+    use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::{
-        positions::SingleLineSpan,
+        hash::DftHashMap,
         syntax::{MatchKind, TokenKind},
     };
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_sorted_novel_positions_simple() {
@@ -699,8 +727,8 @@ mod tests {
         let res = sorted_novel_positions(
             &lhs_mps,
             &[matched_mp],
-            &FxHashMap::default(),
-            &FxHashMap::default(),
+            &DftHashMap::default(),
+            &DftHashMap::default(),
         );
 
         assert_eq!(res, vec![(Side::Left, novel_mp)]);
