@@ -25,19 +25,19 @@
 //! C D
 //! ```
 //!
-//! This module fixes these sliders by sliding novel region regions
-//! forwards or backwards when the before and after nodes are the same
-//! (B in this example).
+//! This module fixes these cases. It identifies situations where we
+//! can change which item is marked as novel (e.g. either `B` in the
+//! example above) whilst still showing a valid, minimal diff.
+
+use line_numbers::SingleLineSpan;
 
 use crate::{
     diff::changes::{insert_deep_novel, insert_deep_unchanged, ChangeKind::*, ChangeMap},
     parse::guess_language,
-    parse::syntax::Syntax,
-    positions::SingleLineSpan,
+    parse::syntax::Syntax::{self, *},
 };
-use Syntax::*;
 
-pub fn fix_all_sliders<'a>(
+pub(crate) fn fix_all_sliders<'a>(
     language: guess_language::Language,
     nodes: &[&'a Syntax<'a>],
     change_map: &mut ChangeMap<'a>,
@@ -56,13 +56,14 @@ fn prefer_outer_delimiter(language: guess_language::Language) -> bool {
     match language {
         // For Lisp family languages, we get the best result with the
         // outer delimiter.
-        EmacsLisp | Clojure | CommonLisp | Janet => true,
+        EmacsLisp | Clojure | CommonLisp | Janet | Racket | Scheme | Newick => true,
         // JSON and TOML are like Lisp: the outer delimiter in an array object
         // is the most relevant.
         Json | Toml | Hcl => true,
-        // It's probably the case that outer delimiters are used more
-        // frequently than inner delimiters in SQl. (foo = 1 OR bar = 2)
-        // is more likely than foo(1).
+        // It's probably the case that outer delimiters
+        // (e.g. grouping) are used more frequently than inner
+        // delimiters in SQL. `(foo = 1 OR bar = 2)` is more likely
+        // than `foo(1)`.
         Sql => true,
         // For everything else, prefer the inner delimiter. These
         // languages have syntax like `foo(bar)` or `foo[bar]` where
@@ -121,20 +122,21 @@ fn fix_nested_slider_prefer_outer<'a>(node: &'a Syntax<'a>, change_map: &mut Cha
             .expect("Changes should be set before slider correction")
         {
             Unchanged(_) => {
-                // All children should be novel except one descendant.
-                let mut found_unchanged = vec![];
-                unchanged_descendants_ignore_delim(children, &mut found_unchanged, change_map);
+                let mut candidates = vec![];
+                unchanged_descendants_for_outer_slider(children, &mut candidates, change_map);
 
-                if let [unchanged] = found_unchanged[..] {
-                    if matches!(unchanged, List { .. })
-                        && matches!(change_map.get(unchanged), Some(Novel))
+                // We can slide if there is a single unchanged
+                // descendant, that descendant is a list, and that
+                // list has novel delimiters.
+                if let [candidate] = candidates[..] {
+                    if matches!(candidate, List { .. })
+                        && matches!(change_map.get(candidate), Some(Novel))
                     {
-                        push_unchanged_to_descendant(node, unchanged, change_map);
+                        push_unchanged_to_descendant(node, candidate, change_map);
                     }
                 }
             }
-            ReplacedComment(_, _) => {}
-            Novel => {}
+            ReplacedComment(_, _) | ReplacedString(_, _) | Novel => {}
         }
 
         for child in children {
@@ -153,7 +155,7 @@ fn fix_nested_slider_prefer_inner<'a>(node: &'a Syntax<'a>, change_map: &mut Cha
             .expect("Changes should be set before slider correction")
         {
             Unchanged(_) => {}
-            ReplacedComment(_, _) => {}
+            ReplacedComment(_, _) | ReplacedString(_, _) => {}
             Novel => {
                 let mut found_unchanged = vec![];
                 unchanged_descendants(children, &mut found_unchanged, change_map);
@@ -187,7 +189,7 @@ fn unchanged_descendants<'a>(
             Unchanged(_) => {
                 found.push(node);
             }
-            Novel | ReplacedComment(_, _) => {
+            Novel | ReplacedComment(_, _) | ReplacedString(_, _) => {
                 if let List { children, .. } = node {
                     unchanged_descendants(children, found, change_map);
                 }
@@ -196,9 +198,18 @@ fn unchanged_descendants<'a>(
     }
 }
 
-/// Find the descendants of `nodes` that are unchanged, but ignore the
-/// delimiter on list nodes.
-fn unchanged_descendants_ignore_delim<'a>(
+/// Nested sliders require a single unchanged descendant whose
+/// delimiters we can slide.
+///
+/// ```
+/// (old-1 (novel (old-2)))
+/// ```
+///
+/// To slide, we want a single list that contains unchanged items but
+/// the outer delimiters are novel.
+///
+/// Find all the unchanged descendants.
+fn unchanged_descendants_for_outer_slider<'a>(
     nodes: &[&'a Syntax<'a>],
     found: &mut Vec<&'a Syntax<'a>>,
     change_map: &ChangeMap<'a>,
@@ -215,24 +226,47 @@ fn unchanged_descendants_ignore_delim<'a>(
         match node {
             Atom { .. } => {
                 if is_unchanged {
+                    // If there's an unchanged atom descendant, we
+                    // can't slide. Sliding the delimiters requires a
+                    // single list, or we are potentially changing the
+                    // diff semantically.
+                    //
+                    // Add to the found items, but terminate early
+                    // since we'll never slide.
                     found.push(node);
+                    break;
                 } else {
-                    // No problem
+                    // Novel atom. This is fine, we're looking for a
+                    // single unchanged node.
                 }
             }
             List { children, .. } => {
-                let all_children_unchanged = true;
-
                 if is_unchanged {
-                    // Outer list is unchanged, not what we wanted.
+                    // This list is unchanged, and the delimiters are
+                    // unchanged. It's an unchanged descendant, but we
+                    // won't be able to slide its delimiters because
+                    // its delimiters are unchanged.
+                    //
+                    // Add to the found items, but terminate early
+                    // since we'll never slide.
                     found.push(node);
+                    break;
                 } else {
-                    // Is changed.
-                    if all_children_unchanged {
-                        // What we're looking for.
+                    // A list whose outer delimiters are novel.
+
+                    let has_unchanged_children = children
+                        .iter()
+                        .any(|node| matches!(change_map.get(node), Some(Unchanged(_))));
+                    if has_unchanged_children {
+                        // The list has unchanged children and novel
+                        // delimiters. This is a candidate for
+                        // sliding.
                         found.push(node);
                     } else {
-                        unchanged_descendants_ignore_delim(children, found, change_map);
+                        // All of the immediate children are novel,
+                        // recurse in case they have descendants that
+                        // are unchanged.
+                        unchanged_descendants_for_outer_slider(children, found, change_map);
                     }
                 }
             }
@@ -306,6 +340,9 @@ fn push_unchanged_to_ancestor<'a>(
     }
 }
 
+/// For every sequence of novel nodes, if it's a potential slider,
+/// change which nodes are marked as novel if it produces a sequence
+/// of nodes that are closer together.
 fn fix_sliders<'a>(nodes: &[&'a Syntax<'a>], change_map: &mut ChangeMap<'a>) {
     for (region_start, region_end) in novel_regions_after_unchanged(nodes, change_map) {
         slide_to_prev_node(nodes, change_map, region_start, region_end);
@@ -315,6 +352,8 @@ fn fix_sliders<'a>(nodes: &[&'a Syntax<'a>], change_map: &mut ChangeMap<'a>) {
     }
 }
 
+/// Return the start and end indexes of sequences of novel nodes that
+/// occur after unchanged nodes.
 fn novel_regions_after_unchanged<'a>(
     nodes: &[&'a Syntax<'a>],
     change_map: &ChangeMap<'a>,
@@ -341,7 +380,7 @@ fn novel_regions_after_unchanged<'a>(
                     region = Some(r);
                 }
             }
-            ReplacedComment(_, _) => {
+            ReplacedComment(_, _) | ReplacedString(_, _) => {
                 // Could have just finished a novel region.
                 if let Some(region) = region {
                     regions.push(region);
@@ -363,6 +402,8 @@ fn novel_regions_after_unchanged<'a>(
         .collect()
 }
 
+/// Return the start and end indexes of sequences of novel nodes that
+/// occur before unchanged nodes.
 fn novel_regions_before_unchanged<'a>(
     nodes: &[&'a Syntax<'a>],
     change_map: &ChangeMap<'a>,
@@ -387,7 +428,7 @@ fn novel_regions_before_unchanged<'a>(
                 r.push(i);
                 region = Some(r);
             }
-            ReplacedComment(_, _) => {
+            ReplacedComment(_, _) | ReplacedString(_, _) => {
                 region = None;
             }
         }
@@ -422,24 +463,24 @@ fn is_novel_deep<'a>(node: &Syntax<'a>, change_map: &ChangeMap<'a>) -> bool {
     }
 }
 
-fn is_unchanged_deep<'a>(node: &Syntax<'a>, change_map: &ChangeMap<'a>) -> bool {
-    match node {
-        List { children, .. } => {
-            if !matches!(change_map.get(node), Some(Unchanged(_))) {
-                return false;
-            }
-            for child in children {
-                if !is_unchanged_deep(child, change_map) {
-                    return false;
-                }
-            }
-
-            true
-        }
-        Atom { .. } => matches!(change_map.get(node), Some(Unchanged(_))),
-    }
-}
-
+/// If the previous node is unchanged, matches the end of the region,
+/// and has a smaller text distance, mark it as novel.
+///
+/// ```text
+/// x UNCHANGED
+/// y NOVEL <- start_idx
+///
+/// x NOVEL <- end_idx
+/// ```
+///
+/// After this function:
+///
+/// ```text
+/// x NOVEL
+/// y NOVEL
+///
+/// x UNCHANGED
+/// ```
 fn slide_to_prev_node<'a>(
     nodes: &[&'a Syntax<'a>],
     change_map: &mut ChangeMap<'a>,
@@ -466,23 +507,26 @@ fn slide_to_prev_node<'a>(
     let distance_to_last = distance_between(before_last_node, last_node);
 
     if distance_to_before_start <= distance_to_last {
-        // Deep checks walk the whole tree, so do these last.
-        if !is_unchanged_deep(before_start_node, change_map) {
-            return;
-        }
+        let opposite = match change_map
+            .get(before_start_node)
+            .expect("Node changes should be set")
+        {
+            Unchanged(n) => {
+                if before_start_node.content_id() != n.content_id() {
+                    return;
+                }
+                n
+            }
+            _ => {
+                return;
+            }
+        };
+
         for node in &nodes[start_idx..=end_idx] {
             if !is_novel_deep(node, change_map) {
                 return;
             }
         }
-
-        let opposite = match change_map
-            .get(before_start_node)
-            .expect("Node changes should be set")
-        {
-            Unchanged(n) => n,
-            _ => unreachable!(),
-        };
 
         insert_deep_novel(before_start_node, change_map);
         insert_deep_unchanged(last_node, opposite, change_map);
@@ -490,6 +534,24 @@ fn slide_to_prev_node<'a>(
     }
 }
 
+/// If the next node is unchanged, matches the beginning of the region,
+/// and has a smaller text distance, mark it as novel.
+///
+/// ```text
+/// x NOVEL <- start_idx
+///
+/// y NOVEL <- end_idx
+/// x UNCHANGED
+/// ```
+///
+/// After this function:
+///
+/// ```text
+/// x UNCHANGED
+///
+/// y NOVEL
+/// x NOVEL
+/// ```
 fn slide_to_next_node<'a>(
     nodes: &[&'a Syntax<'a>],
     change_map: &mut ChangeMap<'a>,
@@ -516,23 +578,25 @@ fn slide_to_next_node<'a>(
     let distance_to_after_last = distance_between(last_node, after_last_node);
 
     if distance_to_after_last < distance_to_start {
-        // Deep checks walk the whole tree, so do these last.
-        if !is_unchanged_deep(after_last_node, change_map) {
-            return;
-        }
+        let opposite = match change_map
+            .get(after_last_node)
+            .expect("Node changes should be set")
+        {
+            Unchanged(n) => {
+                if after_last_node.content_id() != n.content_id() {
+                    return;
+                }
+                n
+            }
+            _ => {
+                return;
+            }
+        };
         for node in &nodes[start_idx..=end_idx] {
             if !is_novel_deep(node, change_map) {
                 return;
             }
         }
-
-        let opposite = match change_map
-            .get(after_last_node)
-            .expect("Node changes should be set")
-        {
-            Unchanged(n) => n,
-            _ => unreachable!(),
-        };
 
         insert_deep_unchanged(start_node, opposite, change_map);
         insert_deep_unchanged(opposite, start_node, change_map);
@@ -607,14 +671,15 @@ impl<'a> Syntax<'a> {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+    use typed_arena::Arena;
+
     use super::*;
     use crate::{
         parse::guess_language,
         parse::tree_sitter_parser::{from_language, parse},
         syntax::{init_all_info, AtomKind},
     };
-    use pretty_assertions::assert_eq;
-    use typed_arena::Arena;
 
     /// Test that we slide at the start if the unchanged node is
     /// closer than the trailing novel node.
@@ -714,13 +779,14 @@ mod tests {
         assert_eq!(change_map.get(lhs[1]), Some(Novel));
         assert_eq!(change_map.get(lhs[2]), Some(Novel));
     }
+
     #[test]
     fn test_slider_two_steps() {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs = parse(&arena, "A B", &config);
-        let rhs = parse(&arena, "A B X\n A B", &config);
+        let lhs = parse(&arena, "A B", &config, false);
+        let rhs = parse(&arena, "A B X\n A B", &config, false);
         init_all_info(&lhs, &rhs);
 
         let mut change_map = ChangeMap::default();
@@ -735,5 +801,47 @@ mod tests {
         assert_eq!(change_map.get(rhs[1]), Some(Novel));
         assert_eq!(change_map.get(rhs[2]), Some(Novel));
         assert_eq!(change_map.get(rhs[3]), Some(Unchanged(rhs[0])));
+    }
+
+    /// If a list is partially unchanged but contains some novel
+    /// children, we should not slide it.
+    #[test]
+    fn test_slider_partially_unchanged() {
+        let arena = Arena::new();
+        let config = from_language(guess_language::Language::EmacsLisp);
+
+        let lhs = parse(&arena, "(A B) X \n (A B)", &config, false);
+        let rhs = parse(&arena, "((novel) A B)", &config, false);
+        init_all_info(&lhs, &rhs);
+
+        let lhs_first_list_children = match lhs[0] {
+            List { children, .. } => children,
+            Atom { .. } => unreachable!(),
+        };
+        let rhs_first_list_children = match rhs[0] {
+            List { children, .. } => children,
+            Atom { .. } => unreachable!(),
+        };
+
+        let mut change_map = ChangeMap::default();
+        change_map.insert(lhs[0], Unchanged(rhs[0]));
+        change_map.insert(lhs[1], Novel);
+        insert_deep_novel(lhs[2], &mut change_map);
+
+        change_map.insert(
+            lhs_first_list_children[0],
+            Unchanged(rhs_first_list_children[1]),
+        );
+        change_map.insert(
+            lhs_first_list_children[1],
+            Unchanged(rhs_first_list_children[2]),
+        );
+
+        fix_all_sliders(guess_language::Language::EmacsLisp, &lhs, &mut change_map);
+        assert_eq!(
+            change_map.get(lhs[2]),
+            Some(Novel),
+            "The novel node at the end should be unaffected"
+        );
     }
 }

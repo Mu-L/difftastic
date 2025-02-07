@@ -2,17 +2,22 @@
 
 #![allow(clippy::mutable_key_type)] // Hash for Syntax doesn't use mutable fields.
 
-use std::{cell::Cell, collections::HashMap, env, fmt, hash::Hash, num::NonZeroU32};
+use std::{cell::Cell, env, fmt, hash::Hash, num::NonZeroU32};
+
+use line_numbers::LinePositions;
+use line_numbers::SingleLineSpan;
 use typed_arena::Arena;
 
+use self::Syntax::*;
+use crate::lines::split_on_newlines;
+use crate::words::split_words_and_numbers;
 use crate::{
     diff::changes::ChangeKind,
     diff::changes::{ChangeKind::*, ChangeMap},
     diff::myers_diff,
-    lines::{LineNumber, NewlinePositions},
-    positions::SingleLineSpan,
+    hash::DftHashMap,
+    lines::is_all_whitespace,
 };
-use Syntax::*;
 
 /// A Debug implementation that does not recurse into the
 /// corresponding node mentioned for Unchanged. Otherwise we will
@@ -21,9 +26,16 @@ impl<'a> fmt::Debug for ChangeKind<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let desc = match self {
             Unchanged(node) => format!("Unchanged(ID: {})", node.id()),
-            ReplacedComment(lhs_node, rhs_node) => {
+            ReplacedComment(lhs_node, rhs_node) | ReplacedString(lhs_node, rhs_node) => {
+                let change_kind = if let ReplacedComment(_, _) = self {
+                    "ReplacedComment"
+                } else {
+                    "ReplacedString"
+                };
+
                 format!(
-                    "ReplacedComment(lhs ID: {}, rhs ID: {})",
+                    "{}(lhs ID: {}, rhs ID: {})",
+                    change_kind,
                     lhs_node.id(),
                     rhs_node.id()
                 )
@@ -34,10 +46,10 @@ impl<'a> fmt::Debug for ChangeKind<'a> {
     }
 }
 
-pub type SyntaxId = NonZeroU32;
+pub(crate) type SyntaxId = NonZeroU32;
 
 /// Fields that are common to both `Syntax::List` and `Syntax::Atom`.
-pub struct SyntaxInfo<'a> {
+pub(crate) struct SyntaxInfo<'a> {
     /// The previous node with the same parent as this one.
     previous_sibling: Cell<Option<&'a Syntax<'a>>>,
     /// The next node with the same parent as this one.
@@ -47,12 +59,9 @@ pub struct SyntaxInfo<'a> {
     prev: Cell<Option<&'a Syntax<'a>>>,
     /// The parent syntax node, if present.
     parent: Cell<Option<&'a Syntax<'a>>>,
-    /// Does the previous syntax node occur on the same line as the
-    /// first line of this node?
-    prev_is_contiguous: Cell<bool>,
     /// The number of nodes that are ancestors of this one.
     num_ancestors: Cell<u32>,
-    pub num_after: Cell<usize>,
+    pub(crate) num_after: Cell<usize>,
     /// A number that uniquely identifies this syntax node.
     unique_id: Cell<SyntaxId>,
     /// A number that uniquely identifies the content of this syntax
@@ -67,13 +76,12 @@ pub struct SyntaxInfo<'a> {
 }
 
 impl<'a> SyntaxInfo<'a> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             previous_sibling: Cell::new(None),
             next_sibling: Cell::new(None),
             prev: Cell::new(None),
             parent: Cell::new(None),
-            prev_is_contiguous: Cell::new(false),
             num_ancestors: Cell::new(0),
             num_after: Cell::new(0),
             unique_id: Cell::new(NonZeroU32::new(u32::MAX).unwrap()),
@@ -89,7 +97,7 @@ impl<'a> Default for SyntaxInfo<'a> {
     }
 }
 
-pub enum Syntax<'a> {
+pub(crate) enum Syntax<'a> {
     List {
         info: SyntaxInfo<'a>,
         open_position: Vec<SingleLineSpan>,
@@ -131,7 +139,7 @@ impl<'a> fmt::Debug for Syntax<'a> {
                 ..
             } => {
                 let mut ds = f.debug_struct(&format!(
-                    "List id:{} content:{}",
+                    "List id:{} content_id:{}",
                     self.id(),
                     self.content_id()
                 ));
@@ -161,7 +169,7 @@ impl<'a> fmt::Debug for Syntax<'a> {
                 ..
             } => {
                 let mut ds = f.debug_struct(&format!(
-                    "Atom id:{} content:{}",
+                    "Atom id:{} content_id:{}",
                     self.id(),
                     self.content_id()
                 ));
@@ -185,7 +193,7 @@ impl<'a> fmt::Debug for Syntax<'a> {
 }
 
 impl<'a> Syntax<'a> {
-    pub fn new_list(
+    pub(crate) fn new_list(
         arena: &'a Arena<Syntax<'a>>,
         open_content: &str,
         open_position: Vec<SingleLineSpan>,
@@ -238,15 +246,24 @@ impl<'a> Syntax<'a> {
         })
     }
 
-    pub fn new_atom(
+    pub(crate) fn new_atom(
         arena: &'a Arena<Syntax<'a>>,
-        position: Vec<SingleLineSpan>,
+        mut position: Vec<SingleLineSpan>,
         mut content: &str,
         kind: AtomKind,
     ) -> &'a Syntax<'a> {
         // If a parser hasn't cleaned up \r on CRLF files with
         // comments, discard it.
         if content.ends_with('\r') {
+            content = &content[..content.len() - 1];
+        }
+
+        // If a parser adds a trailing newline to the atom, discard
+        // it. It produces worse diffs: we'd rather align on real
+        // content, and complicates handling of trailing newlines at
+        // the end of the file.
+        if content.ends_with('\n') {
+            position.pop();
             content = &content[..content.len() - 1];
         }
 
@@ -258,46 +275,42 @@ impl<'a> Syntax<'a> {
         })
     }
 
-    pub fn info(&self) -> &SyntaxInfo<'a> {
+    pub(crate) fn info(&self) -> &SyntaxInfo<'a> {
         match self {
             List { info, .. } | Atom { info, .. } => info,
         }
     }
 
-    pub fn parent(&self) -> Option<&'a Syntax<'a>> {
+    pub(crate) fn parent(&self) -> Option<&'a Syntax<'a>> {
         self.info().parent.get()
     }
 
-    pub fn next_sibling(&self) -> Option<&'a Syntax<'a>> {
+    pub(crate) fn next_sibling(&self) -> Option<&'a Syntax<'a>> {
         self.info().next_sibling.get()
-    }
-
-    pub fn prev_is_contiguous(&self) -> bool {
-        self.info().prev_is_contiguous.get()
     }
 
     /// A unique ID of this syntax node. Every node is guaranteed to
     /// have a different value.
-    pub fn id(&self) -> SyntaxId {
+    pub(crate) fn id(&self) -> SyntaxId {
         self.info().unique_id.get()
     }
 
     /// A content ID of this syntax node. Two nodes have the same
     /// content ID if they have the same content, regardless of
     /// position.
-    pub fn content_id(&self) -> u32 {
+    pub(crate) fn content_id(&self) -> u32 {
         self.info().content_id.get()
     }
 
-    pub fn content_is_unique(&self) -> bool {
+    pub(crate) fn content_is_unique(&self) -> bool {
         self.info().content_is_unique.get()
     }
 
-    pub fn num_ancestors(&self) -> u32 {
+    pub(crate) fn num_ancestors(&self) -> u32 {
         self.info().num_ancestors.get()
     }
 
-    pub fn dbg_content(&self) -> String {
+    pub(crate) fn dbg_content(&self) -> String {
         match self {
             List {
                 open_content,
@@ -307,7 +320,7 @@ impl<'a> Syntax<'a> {
             } => {
                 let line = open_position
                     .first()
-                    .map(|p| format!("{}", p.line.one_indexed()))
+                    .map(|p| p.line.display())
                     .unwrap_or_else(|| "?".to_owned());
 
                 format!("line:{} {} ... {}", line, open_content, close_content)
@@ -317,35 +330,80 @@ impl<'a> Syntax<'a> {
             } => {
                 let line = position
                     .first()
-                    .map_or_else(|| "?".to_owned(), |p| p.line.one_indexed().to_string());
+                    .map_or_else(|| "?".to_owned(), |p| p.line.display());
 
                 format!("line:{} {}", line, content)
             }
         }
     }
+}
 
-    pub fn first_line(&self) -> Option<LineNumber> {
-        let position = match self {
-            List { open_position, .. } => open_position,
-            Atom { position, .. } => position,
-        };
-        position.first().map(|lp| lp.line)
+pub(crate) fn comment_positions<'a>(nodes: &[&'a Syntax<'a>]) -> Vec<SingleLineSpan> {
+    fn walk_comment_positions(node: &Syntax<'_>, positions: &mut Vec<SingleLineSpan>) {
+        match node {
+            List { children, .. } => {
+                for child in children {
+                    walk_comment_positions(child, positions);
+                }
+            }
+            Atom { position, kind, .. } => {
+                if matches!(kind, AtomKind::Comment) {
+                    positions.extend(position);
+                }
+            }
+        }
     }
 
-    pub fn last_line(&self) -> Option<LineNumber> {
-        let position = match self {
-            List { close_position, .. } => close_position,
-            Atom { position, .. } => position,
-        };
-        position.last().map(|lp| lp.line)
+    let mut positions = vec![];
+    for node in nodes {
+        walk_comment_positions(node, &mut positions);
     }
+
+    positions
 }
 
 /// Initialise all the fields in `SyntaxInfo`.
-pub fn init_all_info<'a>(lhs_roots: &[&'a Syntax<'a>], rhs_roots: &[&'a Syntax<'a>]) {
+pub(crate) fn init_all_info<'a>(lhs_roots: &[&'a Syntax<'a>], rhs_roots: &[&'a Syntax<'a>]) {
     init_info(lhs_roots, rhs_roots);
     init_next_prev(lhs_roots);
     init_next_prev(rhs_roots);
+}
+
+pub(crate) fn print_as_dot<'a>(roots: &[&'a Syntax<'a>]) {
+    println!("digraph {{");
+    print_as_dot_(roots);
+    println!("}}");
+}
+
+fn print_as_dot_<'a>(nodes: &[&'a Syntax<'a>]) {
+    for node in nodes {
+        let label = match node {
+            List {
+                open_content,
+                close_content,
+                ..
+            } => {
+                if open_content != "" {
+                    format!("[label=\"{open_content}{close_content}\"]")
+                } else {
+                    "[style=dotted]".to_owned()
+                }
+            }
+            Atom { content, .. } => {
+                let content = content.replace('\"', "\\\"");
+                format!("[label=\"{content}\"]")
+            }
+        };
+
+        println!("  id{} {};", node.id().get(), label);
+
+        if let List { children, .. } = node {
+            for child in children {
+                println!("  id{} -> id{};", node.id().get(), child.id().get());
+            }
+            print_as_dot_(children);
+        }
+    }
 }
 
 fn init_info<'a>(lhs_roots: &[&'a Syntax<'a>], rhs_roots: &[&'a Syntax<'a>]) {
@@ -353,7 +411,7 @@ fn init_info<'a>(lhs_roots: &[&'a Syntax<'a>], rhs_roots: &[&'a Syntax<'a>]) {
     init_info_on_side(lhs_roots, &mut id);
     init_info_on_side(rhs_roots, &mut id);
 
-    let mut existing = HashMap::new();
+    let mut existing = DftHashMap::default();
     set_content_id(lhs_roots, &mut existing);
     set_content_id(rhs_roots, &mut existing);
 
@@ -363,7 +421,7 @@ fn init_info<'a>(lhs_roots: &[&'a Syntax<'a>], rhs_roots: &[&'a Syntax<'a>]) {
 
 type ContentKey = (Option<String>, Option<String>, Vec<u32>, bool, bool);
 
-fn set_content_id(nodes: &[&Syntax], existing: &mut HashMap<ContentKey, u32>) {
+fn set_content_id(nodes: &[&Syntax], existing: &mut DftHashMap<ContentKey, u32>) {
     for node in nodes {
         let key: ContentKey = match node {
             List {
@@ -392,13 +450,11 @@ fn set_content_id(nodes: &[&Syntax], existing: &mut HashMap<ContentKey, u32>) {
                 ..
             } => {
                 let is_comment = *highlight == AtomKind::Comment;
-                let clean_content = if is_comment && content.lines().count() > 1 {
-                    content
-                        .lines()
+                let clean_content = if is_comment && split_on_newlines(content).count() > 1 {
+                    split_on_newlines(content)
                         .map(|l| l.trim_start())
                         .collect::<Vec<_>>()
                         .join("\n")
-                        .to_string()
                 } else {
                     content.clone()
                 };
@@ -424,11 +480,10 @@ fn set_num_after(nodes: &[&Syntax], parent_num_after: usize) {
         }
     }
 }
-pub fn init_next_prev<'a>(roots: &[&'a Syntax<'a>]) {
+pub(crate) fn init_next_prev<'a>(roots: &[&'a Syntax<'a>]) {
     set_prev_sibling(roots);
     set_next_sibling(roots);
     set_prev(roots, None);
-    set_prev_is_contiguous(roots);
 }
 
 /// Set all the `SyntaxInfo` values for all the `roots` on a single
@@ -452,7 +507,7 @@ fn set_unique_id(nodes: &[&Syntax], next_id: &mut SyntaxId) {
 }
 
 /// Assumes that `set_content_id` has already run.
-fn find_nodes_with_unique_content(nodes: &[&Syntax], counts: &mut HashMap<u32, usize>) {
+fn find_nodes_with_unique_content(nodes: &[&Syntax], counts: &mut DftHashMap<u32, usize>) {
     for node in nodes {
         *counts.entry(node.content_id()).or_insert(0) += 1;
         if let List { children, .. } = node {
@@ -461,7 +516,7 @@ fn find_nodes_with_unique_content(nodes: &[&Syntax], counts: &mut HashMap<u32, u
     }
 }
 
-fn set_content_is_unique_from_counts(nodes: &[&Syntax], counts: &HashMap<u32, usize>) {
+fn set_content_is_unique_from_counts(nodes: &[&Syntax], counts: &DftHashMap<u32, usize>) {
     for node in nodes {
         let count = counts
             .get(&node.content_id())
@@ -475,19 +530,17 @@ fn set_content_is_unique_from_counts(nodes: &[&Syntax], counts: &HashMap<u32, us
 }
 
 fn set_content_is_unique(nodes: &[&Syntax]) {
-    let mut counts = HashMap::new();
+    let mut counts = DftHashMap::default();
     find_nodes_with_unique_content(nodes, &mut counts);
     set_content_is_unique_from_counts(nodes, &counts);
 }
 
 fn set_prev_sibling<'a>(nodes: &[&'a Syntax<'a>]) {
-    for (i, node) in nodes.iter().enumerate() {
-        if i == 0 {
-            continue;
-        }
+    let mut prev = None;
 
-        let sibling = nodes.get(i - 1).copied();
-        node.info().previous_sibling.set(sibling);
+    for node in nodes {
+        node.info().previous_sibling.set(prev);
+        prev = Some(node);
 
         if let List { children, .. } = node {
             set_prev_sibling(children);
@@ -538,35 +591,6 @@ fn set_num_ancestors(nodes: &[&Syntax], num_ancestors: u32) {
     }
 }
 
-fn set_prev_is_contiguous(roots: &[&Syntax]) {
-    for node in roots {
-        let is_contiguous = if let Some(prev) = node.info().prev.get() {
-            match prev {
-                List {
-                    open_position,
-                    close_position,
-                    ..
-                } => {
-                    let prev_is_parent = prev.num_ancestors() < node.num_ancestors();
-                    if prev_is_parent {
-                        open_position.last().map(|p| p.line) == node.first_line()
-                    } else {
-                        // predecessor node at the same level.
-                        close_position.last().map(|p| p.line) == node.first_line()
-                    }
-                }
-                Atom { .. } => prev.last_line() == node.first_line(),
-            }
-        } else {
-            false
-        };
-        node.info().prev_is_contiguous.set(is_contiguous);
-        if let List { children, .. } = node {
-            set_prev_is_contiguous(children);
-        }
-    }
-}
-
 impl<'a> PartialEq for Syntax<'a> {
     fn eq(&self, other: &Self) -> bool {
         debug_assert!(self.content_id() > 0);
@@ -576,10 +600,22 @@ impl<'a> PartialEq for Syntax<'a> {
 }
 impl<'a> Eq for Syntax<'a> {}
 
+/// Different types of strings. We want to diff these the same way,
+/// but highlight them differently.
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
-pub enum AtomKind {
+pub(crate) enum StringKind {
+    /// A string literal, such as `"foo"`.
+    StringLiteral,
+    /// Plain text, such as the content of `<p>foo</p>`.
+    Text,
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub(crate) enum AtomKind {
     Normal,
-    String,
+    // TODO: We should either have a AtomWithWords(HighlightKind) or a
+    // separate String, Text and Comment kind.
+    String(StringKind),
     Type,
     Comment,
     Keyword,
@@ -588,121 +624,145 @@ pub enum AtomKind {
 
 /// Unlike atoms, tokens can be delimiters like `{`.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum TokenKind {
+pub(crate) enum TokenKind {
     Delimiter,
     Atom(AtomKind),
 }
 
 /// A matched token (an atom, a delimiter, or a comment word).
 #[derive(PartialEq, Eq, Debug, Clone)]
-pub enum MatchKind {
+pub(crate) enum MatchKind {
     UnchangedToken {
         highlight: TokenKind,
         self_pos: Vec<SingleLineSpan>,
         opposite_pos: Vec<SingleLineSpan>,
     },
-    Novel {
-        highlight: TokenKind,
-    },
-    NovelLinePart {
+    /// A novel token in an AST diff.
+    Novel { highlight: TokenKind },
+    /// When we have a novel item, we often want to highlight novel
+    /// words more prominently. UnchangedPartOfNovelItem represents
+    /// the parts that don't get this special highlighting.
+    ///
+    /// For example, line-based diffs we want to highlight `a` and `b`
+    /// differently to `foo` here.
+    ///
+    /// foo a
+    /// foo b
+    ///
+    /// Whereas for syntactic diffs, we want to do the same thing for
+    /// strings and comments.
+    ///
+    /// "foo a"
+    /// "foo b"
+    ///
+    /// The whole string is a distinct value, but the `a` and `b` are
+    /// the most interesting parts.
+    UnchangedPartOfNovelItem {
         highlight: TokenKind,
         self_pos: SingleLineSpan,
         opposite_pos: Vec<SingleLineSpan>,
     },
-    NovelWord {
-        highlight: TokenKind,
-    },
+    /// The novel part of the novel item. For line-based diffs, this
+    /// is the words that are unique to this line.
+    ///
+    /// See the discussion in `UnchangedPartOfNovelItem`.
+    NovelWord { highlight: TokenKind },
+    /// A syntactic token that was ignored by the AST diff (e.g. when
+    /// ignoring comments for diffing).
+    Ignored { highlight: TokenKind },
 }
 
 impl MatchKind {
-    pub fn is_novel(&self) -> bool {
+    pub(crate) fn is_novel(&self) -> bool {
         matches!(
             self,
-            MatchKind::Novel { .. } | MatchKind::NovelWord { .. } | MatchKind::NovelLinePart { .. }
+            MatchKind::Novel { .. }
+                | MatchKind::NovelWord { .. }
+                | MatchKind::UnchangedPartOfNovelItem { .. }
         )
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatchedPos {
-    pub kind: MatchKind,
-    pub pos: SingleLineSpan,
+pub(crate) struct MatchedPos {
+    pub(crate) kind: MatchKind,
+    pub(crate) pos: SingleLineSpan,
 }
 
-/// Split `s` into a vec of things that look like words and individual
-/// non-word characters.
+/// Given the text `content` from a comment or strings, split it into
+/// MatchedPos values for the novel and unchanged words.
 ///
-/// "foo bar" -> vec!["foo", " ", "bar"]
-pub fn split_words(s: &str) -> Vec<&str> {
-    let mut res = vec![];
-    let mut word_start = None;
-    for (idx, c) in s.char_indices() {
-        if c.is_alphanumeric() {
-            if word_start.is_none() {
-                word_start = Some(idx);
-            }
-        } else {
-            if let Some(start) = word_start {
-                res.push(&s[start..idx]);
-                word_start = None;
-            }
-            res.push(&s[idx..idx + c.len_utf8()]);
-        }
-    }
-
-    if let Some(start) = word_start {
-        res.push(&s[start..]);
-    }
-    res
-}
-
-fn split_comment_words(
+/// If there is negligible text in common with `opposite_content`,
+/// treat the whole `content` as a single novel region.
+fn split_atom_words(
     content: &str,
-    pos: SingleLineSpan,
+    pos: &[SingleLineSpan],
     opposite_content: &str,
-    opposite_pos: SingleLineSpan,
+    opposite_pos: &[SingleLineSpan],
+    kind: AtomKind,
 ) -> Vec<MatchedPos> {
+    debug_assert!(kind == AtomKind::Comment || matches!(kind, AtomKind::String(_)));
+
     // TODO: merge adjacent single-line comments unless there are
     // blank lines between them.
-    let content_parts = split_words(content);
-    let other_parts = split_words(opposite_content);
+    let content_parts = split_words_and_numbers(content);
+    let other_parts = split_words_and_numbers(opposite_content);
 
-    let content_newlines = NewlinePositions::from(content);
-    let opposite_content_newlines = NewlinePositions::from(opposite_content);
+    let word_diffs = myers_diff::slice_by_hash(&content_parts, &other_parts);
+
+    if !has_common_words(&word_diffs) {
+        return pos
+            .iter()
+            .map(|line| MatchedPos {
+                kind: MatchKind::Novel {
+                    highlight: TokenKind::Atom(kind),
+                },
+                pos: *line,
+            })
+            .collect();
+    }
+
+    let content_newlines = LinePositions::from(content);
+    let opposite_content_newlines = LinePositions::from(opposite_content);
 
     let mut offset = 0;
     let mut opposite_offset = 0;
 
-    let mut res = vec![];
-    for diff_res in myers_diff::slice(&content_parts, &other_parts) {
+    let mut mps = vec![];
+    for diff_res in word_diffs {
         match diff_res {
             myers_diff::DiffResult::Left(word) => {
                 // This word is novel to this side.
-                res.push(MatchedPos {
-                    kind: MatchKind::NovelWord {
-                        highlight: TokenKind::Atom(AtomKind::Comment),
-                    },
-                    pos: content_newlines.from_offsets_relative_to(
-                        pos,
-                        offset,
-                        offset + word.len(),
-                    )[0],
-                });
+                if !is_all_whitespace(word) {
+                    mps.push(MatchedPos {
+                        kind: MatchKind::NovelWord {
+                            highlight: TokenKind::Atom(kind),
+                        },
+                        pos: content_newlines.from_region_relative_to(
+                            // TODO: don't assume a single line atom.
+                            pos[0],
+                            offset,
+                            offset + word.len(),
+                        )[0],
+                    });
+                }
                 offset += word.len();
             }
             myers_diff::DiffResult::Both(word, opposite_word) => {
                 // This word is present on both sides.
+                // TODO: don't assume this atom is on a single line.
                 let word_pos =
-                    content_newlines.from_offsets_relative_to(pos, offset, offset + word.len())[0];
-                let opposite_word_pos = opposite_content_newlines.from_offsets_relative_to(
-                    opposite_pos,
+                    content_newlines.from_region_relative_to(pos[0], offset, offset + word.len())
+                        [0];
+                let opposite_word_pos = opposite_content_newlines.from_region_relative_to(
+                    opposite_pos[0],
                     opposite_offset,
                     opposite_offset + opposite_word.len(),
                 );
 
-                res.push(MatchedPos {
-                    kind: MatchKind::NovelLinePart {
-                        highlight: TokenKind::Atom(AtomKind::Comment),
+                mps.push(MatchedPos {
+                    kind: MatchKind::UnchangedPartOfNovelItem {
+                        highlight: TokenKind::Atom(kind),
                         self_pos: word_pos,
                         opposite_pos: opposite_word_pos,
                     },
@@ -718,7 +778,51 @@ fn split_comment_words(
         }
     }
 
-    res
+    mps
+}
+
+/// Are there sufficient common words that we should only highlight
+/// individual changed words?
+fn has_common_words(word_diffs: &Vec<myers_diff::DiffResult<&&str>>) -> bool {
+    let mut novel_count = 0;
+    let mut unchanged_count = 0;
+
+    for word_diff in word_diffs {
+        match word_diff {
+            myers_diff::DiffResult::Both(word, _) => {
+                if **word != " " {
+                    unchanged_count += 1;
+                }
+            }
+            _ => {
+                novel_count += 1;
+            }
+        }
+    }
+
+    // We want more than two unchanged words, because the text content
+    // includes the comment or string delimiters.
+    //
+    // A sufficiently similar set of words is when more than 50% of
+    // the words are common between the two sides. We multiply by two
+    // because non-matching words gives us two novel words, whereas
+    // matched words only gives us one unchanged word.
+    unchanged_count > 2 && unchanged_count * 2 >= novel_count
+}
+
+/// Skip line spans at the beginning or end that have zero width.
+fn filter_empty_ends(line_spans: &[SingleLineSpan]) -> Vec<SingleLineSpan> {
+    let mut spans: Vec<SingleLineSpan> = vec![];
+
+    for (i, span) in line_spans.iter().enumerate() {
+        if (i == 0 || i == line_spans.len() - 1) && span.start_col == span.end_col {
+            continue;
+        }
+
+        spans.push(*span);
+    }
+
+    spans
 }
 
 impl MatchedPos {
@@ -726,10 +830,16 @@ impl MatchedPos {
         ck: ChangeKind,
         highlight: TokenKind,
         pos: &[SingleLineSpan],
-        is_close: bool,
+        is_close_delim: bool,
     ) -> Vec<Self> {
+        // Don't create a MatchedPos for empty positions at the start
+        // or end. We still want empty positions in the middle of
+        // multiline atoms, as a multiline string literal may include
+        // empty lines.
+        let pos = filter_empty_ends(pos);
+
         match ck {
-            ReplacedComment(this, opposite) => {
+            ReplacedComment(this, opposite) | ReplacedString(this, opposite) => {
                 let this_content = match this {
                     List { .. } => unreachable!(),
                     Atom { content, .. } => content,
@@ -741,13 +851,19 @@ impl MatchedPos {
                     } => (content, position),
                 };
 
-                split_comment_words(
-                    this_content,
-                    // TODO: handle the whole pos here.
-                    pos[0],
-                    opposite_content,
-                    opposite_pos[0],
-                )
+                let kind = if let ReplacedString(this, _) = ck {
+                    match this {
+                        Atom {
+                            kind: AtomKind::String(StringKind::Text),
+                            ..
+                        } => AtomKind::String(StringKind::Text),
+                        _ => AtomKind::String(StringKind::StringLiteral),
+                    }
+                } else {
+                    AtomKind::Comment
+                };
+
+                split_atom_words(this_content, &pos, opposite_content, opposite_pos, kind)
             }
             Unchanged(opposite) => {
                 let opposite_pos = match opposite {
@@ -756,7 +872,7 @@ impl MatchedPos {
                         close_position,
                         ..
                     } => {
-                        if is_close {
+                        if is_close_delim {
                             close_position.clone()
                         } else {
                             open_position.clone()
@@ -773,17 +889,9 @@ impl MatchedPos {
                 };
 
                 // Create a MatchedPos for every line that `pos` covers.
-                let mut res = vec![];
-                for (i, line_pos) in pos.iter().enumerate() {
-                    // Don't create a MatchedPos for empty positions
-                    // at the start. We will want empty positions on
-                    // multiline atoms elsewhere, as a multline string
-                    // literal may include empty lines.
-                    if i == 0 && line_pos.start_col == line_pos.end_col {
-                        continue;
-                    }
-
-                    res.push(Self {
+                let mut mps = vec![];
+                for line_pos in &pos {
+                    mps.push(Self {
                         kind: kind.clone(),
                         pos: *line_pos,
                     });
@@ -792,43 +900,73 @@ impl MatchedPos {
                     // MatchedPos on the LHS and RHS. This allows us
                     // to consider unchanged MatchedPos values
                     // pairwise.
-                    if res.len() == opposite_pos_len {
+                    if mps.len() == opposite_pos_len {
                         break;
                     }
                 }
-                res
+                mps
             }
             Novel => {
                 let kind = MatchKind::Novel { highlight };
                 // Create a MatchedPos for every line that `pos` covers.
-                let mut res = vec![];
-                for line_pos in pos {
-                    // Don't create a MatchedPos for empty positions. This
+                let mut mps = vec![];
+                for line_pos in &pos {
+                    // Don't create a MatchedPos for entirely empty positions. This
                     // occurs when we have lists with empty open/close
                     // delimiter positions, such as the top-level list of syntax items.
                     if pos.len() == 1 && line_pos.start_col == line_pos.end_col {
                         continue;
                     }
 
-                    res.push(Self {
+                    mps.push(Self {
                         kind: kind.clone(),
                         pos: *line_pos,
                     });
                 }
 
-                res
+                mps
             }
         }
     }
 }
 
 /// Walk `nodes` and return a vec of all the changed positions.
-pub fn change_positions<'a>(
+pub(crate) fn change_positions<'a>(
     nodes: &[&'a Syntax<'a>],
     change_map: &ChangeMap<'a>,
 ) -> Vec<MatchedPos> {
     let mut positions = Vec::new();
-    change_positions_(nodes, change_map, &mut positions);
+    let mut seen_unchanged = false;
+
+    change_positions_(nodes, change_map, &mut positions, &mut seen_unchanged);
+
+    // If there are no unchanged items, insert a dummy item at the
+    // beginning of both files with a width of zero. This gives
+    // display something to use when aligning.
+    if !seen_unchanged {
+        let lhs_pos = SingleLineSpan {
+            line: 0.into(),
+            start_col: 0,
+            end_col: 0,
+        };
+        let rhs_pos = SingleLineSpan {
+            line: 0.into(),
+            start_col: 0,
+            end_col: 0,
+        };
+        positions.insert(
+            0,
+            MatchedPos {
+                kind: MatchKind::UnchangedToken {
+                    highlight: TokenKind::Atom(AtomKind::Normal),
+                    self_pos: vec![lhs_pos],
+                    opposite_pos: vec![rhs_pos],
+                },
+                pos: lhs_pos,
+            },
+        );
+    }
+
     positions
 }
 
@@ -836,11 +974,16 @@ fn change_positions_<'a>(
     nodes: &[&'a Syntax<'a>],
     change_map: &ChangeMap<'a>,
     positions: &mut Vec<MatchedPos>,
+    seen_unchanged: &mut bool,
 ) {
     for node in nodes {
         let change = change_map
             .get(node)
             .unwrap_or_else(|| panic!("Should have changes set in all nodes: {:#?}", node));
+
+        if matches!(change, ChangeKind::Unchanged(_)) {
+            *seen_unchanged = true;
+        }
 
         match node {
             List {
@@ -856,7 +999,7 @@ fn change_positions_<'a>(
                     false,
                 ));
 
-                change_positions_(children, change_map, positions);
+                change_positions_(children, change_map, positions, seen_unchanged);
 
                 positions.extend(MatchedPos::new(
                     change,
@@ -877,7 +1020,7 @@ fn change_positions_<'a>(
     }
 }
 
-pub fn zip_pad_shorter<Tx: Clone, Ty: Clone>(
+pub(crate) fn zip_pad_shorter<Tx: Clone, Ty: Clone>(
     lhs: &[Tx],
     rhs: &[Ty],
 ) -> Vec<(Option<Tx>, Option<Ty>)> {
@@ -897,7 +1040,7 @@ pub fn zip_pad_shorter<Tx: Clone, Ty: Clone>(
 
 /// Zip `lhs` with `rhs`, but repeat the last item from the shorter
 /// slice.
-pub fn zip_repeat_shorter<Tx: Clone, Ty: Clone>(lhs: &[Tx], rhs: &[Ty]) -> Vec<(Tx, Ty)> {
+pub(crate) fn zip_repeat_shorter<Tx: Clone, Ty: Clone>(lhs: &[Tx], rhs: &[Ty]) -> Vec<(Tx, Ty)> {
     let lhs_last: Tx = match lhs.last() {
         Some(last) => last.clone(),
         None => return vec![],
@@ -925,8 +1068,9 @@ pub fn zip_repeat_shorter<Tx: Clone, Ty: Clone>(lhs: &[Tx], rhs: &[Ty]) -> Vec<(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pretty_assertions::assert_eq;
+
+    use super::*;
 
     /// Consider comment atoms as distinct to other atoms even if the
     /// content matches otherwise.
@@ -963,7 +1107,44 @@ mod tests {
         }
     }
 
-    /// Ignore the syntax highighting kind when comparing
+    #[test]
+    fn test_new_atom_truncates_trailing_newline() {
+        let arena = Arena::new();
+        let position = vec![
+            SingleLineSpan {
+                line: 0.into(),
+                start_col: 0,
+                end_col: 8,
+            },
+            SingleLineSpan {
+                line: 1.into(),
+                start_col: 0,
+                end_col: 1,
+            },
+        ];
+        let content = ";; hello\n";
+
+        let atom = Syntax::new_atom(&arena, position, content, AtomKind::Comment);
+
+        match atom {
+            List { .. } => unreachable!(),
+            Atom {
+                position, content, ..
+            } => {
+                assert_eq!(content, ";; hello");
+                assert_eq!(
+                    *position,
+                    vec![SingleLineSpan {
+                        line: 0.into(),
+                        start_col: 0,
+                        end_col: 8,
+                    }]
+                );
+            }
+        }
+    }
+
+    /// Ignore the syntax highlighting kind when comparing
     /// atoms. Sometimes changing delimiter wrapping can change
     /// whether a parser thinks that a node is e.g. a type.
     #[test]
@@ -1038,76 +1219,142 @@ mod tests {
     }
 
     #[test]
-    fn test_split_comment_words_basic() {
-        let content = "abc";
-        let pos = SingleLineSpan {
+    fn test_split_atom_words() {
+        let content = "abc def ghi novel";
+        let pos = vec![SingleLineSpan {
             line: 0.into(),
             start_col: 0,
-            end_col: 3,
-        };
+            end_col: 17,
+        }];
 
-        let opposite_content = "def";
-        let opposite_pos = SingleLineSpan {
+        let opposite_content = "abc def ghi";
+        let opposite_pos = vec![SingleLineSpan {
             line: 0.into(),
             start_col: 0,
-            end_col: 3,
-        };
+            end_col: 11,
+        }];
 
-        let res = split_comment_words(content, pos, opposite_content, opposite_pos);
+        let res = split_atom_words(
+            content,
+            &pos,
+            opposite_content,
+            &opposite_pos,
+            AtomKind::Comment,
+        );
         assert_eq!(
             res,
-            vec![MatchedPos {
-                kind: MatchKind::NovelWord {
-                    highlight: TokenKind::Atom(AtomKind::Comment),
+            vec![
+                MatchedPos {
+                    kind: MatchKind::UnchangedPartOfNovelItem {
+                        highlight: TokenKind::Atom(AtomKind::Comment),
+                        self_pos: SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 0,
+                            end_col: 3
+                        },
+                        opposite_pos: vec![SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 0,
+                            end_col: 3
+                        }]
+                    },
+                    pos: SingleLineSpan {
+                        line: 0.into(),
+                        start_col: 0,
+                        end_col: 3
+                    }
                 },
-                pos: SingleLineSpan {
-                    line: 0.into(),
-                    start_col: 0,
-                    end_col: 3
+                MatchedPos {
+                    kind: MatchKind::UnchangedPartOfNovelItem {
+                        highlight: TokenKind::Atom(AtomKind::Comment),
+                        self_pos: SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 3,
+                            end_col: 4
+                        },
+                        opposite_pos: vec![SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 3,
+                            end_col: 4
+                        }]
+                    },
+                    pos: SingleLineSpan {
+                        line: 0.into(),
+                        start_col: 3,
+                        end_col: 4
+                    }
                 },
-            },]
+                MatchedPos {
+                    kind: MatchKind::UnchangedPartOfNovelItem {
+                        highlight: TokenKind::Atom(AtomKind::Comment),
+                        self_pos: SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 4,
+                            end_col: 7
+                        },
+                        opposite_pos: vec![SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 4,
+                            end_col: 7
+                        }]
+                    },
+                    pos: SingleLineSpan {
+                        line: 0.into(),
+                        start_col: 4,
+                        end_col: 7
+                    }
+                },
+                MatchedPos {
+                    kind: MatchKind::UnchangedPartOfNovelItem {
+                        highlight: TokenKind::Atom(AtomKind::Comment),
+                        self_pos: SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 7,
+                            end_col: 8
+                        },
+                        opposite_pos: vec![SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 7,
+                            end_col: 8
+                        }]
+                    },
+                    pos: SingleLineSpan {
+                        line: 0.into(),
+                        start_col: 7,
+                        end_col: 8
+                    }
+                },
+                MatchedPos {
+                    kind: MatchKind::UnchangedPartOfNovelItem {
+                        highlight: TokenKind::Atom(AtomKind::Comment),
+                        self_pos: SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 8,
+                            end_col: 11
+                        },
+                        opposite_pos: vec![SingleLineSpan {
+                            line: 0.into(),
+                            start_col: 8,
+                            end_col: 11
+                        }]
+                    },
+                    pos: SingleLineSpan {
+                        line: 0.into(),
+                        start_col: 8,
+                        end_col: 11
+                    }
+                },
+                MatchedPos {
+                    kind: MatchKind::NovelWord {
+                        highlight: TokenKind::Atom(AtomKind::Comment)
+                    },
+                    pos: SingleLineSpan {
+                        line: 0.into(),
+                        start_col: 12,
+                        end_col: 17
+                    }
+                }
+            ],
         );
-    }
-
-    #[test]
-    fn test_split_words() {
-        let s = "example.com";
-        let res = split_words(s);
-        assert_eq!(res, vec!["example", ".", "com"])
-    }
-
-    #[test]
-    fn test_split_words_punctuations() {
-        let s = "example..";
-        let res = split_words(s);
-        assert_eq!(res, vec!["example", ".", "."])
-    }
-
-    #[test]
-    fn test_split_words_treats_newline_separately() {
-        let s = "example.\ncom";
-        let res = split_words(s);
-        assert_eq!(res, vec!["example", ".", "\n", "com"])
-    }
-
-    #[test]
-    fn test_split_words_single_unicode() {
-        let s = "a ö b";
-        let res = split_words(s);
-        assert_eq!(res, vec!["a", " ", "ö", " ", "b"])
-    }
-
-    #[test]
-    fn test_split_words_single_unicode_not_alphabetic() {
-        let s = "a 💝 b";
-        let res = split_words(s);
-        assert_eq!(res, vec!["a", " ", "💝", " ", "b"])
-    }
-
-    #[test]
-    fn test_split_words_unicode() {
-        let s = "a xöy b";
-        let res = split_words(s);
-        assert_eq!(res, vec!["a", " ", "xöy", " ", "b"])
     }
 }

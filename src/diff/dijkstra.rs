@@ -3,44 +3,46 @@
 
 use std::{cmp::Reverse, env};
 
-use crate::{
-    diff::changes::ChangeMap,
-    diff::graph::{get_set_neighbours, populate_change_map, Edge, Vertex},
-    parse::syntax::Syntax,
-};
 use bumpalo::Bump;
 use itertools::Itertools;
 use radix_heap::RadixHeapMap;
-use rustc_hash::FxHashMap;
+
+use crate::{
+    diff::changes::ChangeMap,
+    diff::graph::{populate_change_map, set_neighbours, Edge, Vertex},
+    hash::DftHashMap,
+    parse::syntax::Syntax,
+};
 
 #[derive(Debug)]
-pub struct ExceededGraphLimit {}
+pub(crate) struct ExceededGraphLimit {}
 
 /// Return the shortest route from `start` to the end vertex.
-fn shortest_vertex_path<'a, 'b>(
-    start: &'b Vertex<'a, 'b>,
+fn shortest_vertex_path<'s, 'b>(
+    start: &'b Vertex<'s, 'b>,
     vertex_arena: &'b Bump,
     size_hint: usize,
     graph_limit: usize,
-) -> Result<Vec<&'b Vertex<'a, 'b>>, ExceededGraphLimit> {
+) -> Result<Vec<&'b Vertex<'s, 'b>>, ExceededGraphLimit> {
     // We want to visit nodes with the shortest distance first, but
     // RadixHeapMap is a max-heap. Ensure nodes are wrapped with
     // Reverse to flip comparisons.
-    let mut heap: RadixHeapMap<Reverse<_>, &'b Vertex<'a, 'b>> = RadixHeapMap::new();
+    let mut heap: RadixHeapMap<Reverse<_>, &'b Vertex<'s, 'b>> = RadixHeapMap::new();
 
     heap.push(Reverse(0), start);
 
-    let mut seen = FxHashMap::default();
+    let mut seen = DftHashMap::default();
     seen.reserve(size_hint);
 
-    let end: &'b Vertex<'a, 'b> = loop {
+    let end: &'b Vertex<'s, 'b> = loop {
         match heap.pop() {
             Some((Reverse(distance), current)) => {
                 if current.is_end() {
                     break current;
                 }
 
-                for neighbour in &get_set_neighbours(current, vertex_arena, &mut seen) {
+                set_neighbours(current, vertex_arena, &mut seen);
+                for neighbour in *current.neighbours.borrow().as_ref().unwrap() {
                     let (edge, next) = neighbour;
                     let distance_to_next = distance + edge.cost();
 
@@ -56,6 +58,10 @@ fn shortest_vertex_path<'a, 'b>(
                 }
 
                 if seen.len() > graph_limit {
+                    info!(
+                        "Reached graph limit, arena consumed {}",
+                        humansize::format_size(vertex_arena.allocated_bytes(), humansize::BINARY),
+                    );
                     return Err(ExceededGraphLimit {});
                 }
             }
@@ -63,15 +69,16 @@ fn shortest_vertex_path<'a, 'b>(
         }
     };
 
-    debug!(
-        "Saw {} vertices (a Vertex is {} bytes), with {} left on heap.",
+    info!(
+        "Saw {} vertices (a Vertex is {} bytes), arena consumed {}, with {} vertices left on heap.",
         seen.len(),
         std::mem::size_of::<Vertex>(),
+        humansize::format_size(vertex_arena.allocated_bytes(), humansize::BINARY),
         heap.len(),
     );
 
     let mut current = Some((0, end));
-    let mut vertex_route: Vec<&'b Vertex<'a, 'b>> = vec![];
+    let mut vertex_route: Vec<&'b Vertex<'s, 'b>> = vec![];
     while let Some((_, node)) = current {
         vertex_route.push(node);
         current = node.predecessor.get();
@@ -81,9 +88,9 @@ fn shortest_vertex_path<'a, 'b>(
     Ok(vertex_route)
 }
 
-fn shortest_path_with_edges<'a, 'b>(
-    route: &[&'b Vertex<'a, 'b>],
-) -> Vec<(Edge, &'b Vertex<'a, 'b>)> {
+fn shortest_path_with_edges<'s, 'b>(
+    route: &[&'b Vertex<'s, 'b>],
+) -> Vec<(Edge, &'b Vertex<'s, 'b>)> {
     let mut prev = route.first().expect("Expected non-empty route");
 
     let mut cost = 0;
@@ -105,23 +112,23 @@ fn shortest_path_with_edges<'a, 'b>(
 ///
 /// The vec returned does not return the very last vertex. This is
 /// necessary because a route of N vertices only has N-1 edges.
-fn shortest_path<'a, 'b>(
-    start: Vertex<'a, 'b>,
+fn shortest_path<'s, 'b>(
+    start: Vertex<'s, 'b>,
     vertex_arena: &'b Bump,
     size_hint: usize,
     graph_limit: usize,
-) -> Result<Vec<(Edge, &'b Vertex<'a, 'b>)>, ExceededGraphLimit> {
-    let start: &'b Vertex<'a, 'b> = vertex_arena.alloc(start.clone());
+) -> Result<Vec<(Edge, &'b Vertex<'s, 'b>)>, ExceededGraphLimit> {
+    let start: &'b Vertex<'s, 'b> = vertex_arena.alloc(start);
     let vertex_path = shortest_vertex_path(start, vertex_arena, size_hint, graph_limit)?;
     Ok(shortest_path_with_edges(&vertex_path))
 }
 
-fn edge_between<'a, 'b>(before: &Vertex<'a, 'b>, after: &Vertex<'a, 'b>) -> Edge {
+fn edge_between<'s, 'b>(before: &Vertex<'s, 'b>, after: &Vertex<'s, 'b>) -> Edge {
     assert_ne!(before, after);
 
     let mut shortest_edge: Option<Edge> = None;
     if let Some(neighbours) = &*before.neighbours.borrow() {
-        for neighbour in neighbours {
+        for neighbour in *neighbours {
             let (edge, next) = *neighbour;
             // If there are multiple edges that can take us to `next`,
             // prefer the shortest.
@@ -179,7 +186,7 @@ fn tree_count(root: Option<&Syntax>) -> u32 {
     count
 }
 
-pub fn mark_syntax<'a>(
+pub(crate) fn mark_syntax<'a>(
     lhs_syntax: Option<&'a Syntax<'a>>,
     rhs_syntax: Option<&'a Syntax<'a>>,
     change_map: &mut ChangeMap<'a>,
@@ -199,7 +206,12 @@ pub fn mark_syntax<'a>(
     // graph whose size is roughly quadratic. Use this as a size hint,
     // so we don't spend too much time re-hashing and expanding the
     // predecessors hashmap.
-    let size_hint = lhs_node_count * rhs_node_count;
+    //
+    // Cap this number to the graph limit, so we don't try to allocate
+    // an absurdly large (i.e. greater than physical memory) hashmap
+    // when there is a large number of nodes. We'll never visit more
+    // than graph_limit nodes.
+    let size_hint = std::cmp::min(lhs_node_count * rhs_node_count, graph_limit);
 
     let start = Vertex::new(lhs_syntax, rhs_syntax);
     let vertex_arena = Bump::new();
@@ -216,15 +228,15 @@ pub fn mark_syntax<'a>(
         print_length,
         route
             .iter()
-            .map(|x| {
+            .map(|(edge, v)| {
                 format!(
                     "{:20} {:20} --- {:3} {:?}",
-                    x.1.lhs_syntax
+                    v.lhs_syntax
                         .map_or_else(|| "None".into(), Syntax::dbg_content),
-                    x.1.rhs_syntax
+                    v.rhs_syntax
                         .map_or_else(|| "None".into(), Syntax::dbg_content),
-                    x.0.cost(),
-                    x.0,
+                    edge.cost(),
+                    edge,
                 )
             })
             .take(print_length)
@@ -237,31 +249,23 @@ pub fn mark_syntax<'a>(
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+    use line_numbers::SingleLineSpan;
+    use typed_arena::Arena;
+
     use super::*;
     use crate::{
         diff::changes::ChangeKind,
         diff::graph::Edge::*,
         options::DEFAULT_GRAPH_LIMIT,
-        positions::SingleLineSpan,
         syntax::{init_all_info, AtomKind},
     };
-
-    use itertools::Itertools;
-    use typed_arena::Arena;
 
     fn pos_helper(line: u32) -> Vec<SingleLineSpan> {
         vec![SingleLineSpan {
             line: line.into(),
             start_col: 0,
             end_col: 1,
-        }]
-    }
-
-    fn col_helper(line: u32, col: u32) -> Vec<SingleLineSpan> {
-        vec![SingleLineSpan {
-            line: line.into(),
-            start_col: col,
-            end_col: col + 1,
         }]
     }
 
@@ -282,6 +286,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![UnchangedNode {
+                probably_punctuation: false,
                 depth_difference: 0
             }]
         );
@@ -315,7 +320,7 @@ mod tests {
         )];
         init_all_info(&lhs, &rhs);
 
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
+        let start = Vertex::new(lhs.first().copied(), rhs.first().copied());
         let vertex_arena = Bump::new();
         let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
 
@@ -326,11 +331,7 @@ mod tests {
                 EnterUnchangedDelimiter {
                     depth_difference: 0
                 },
-                NovelAtomLHS {
-                    contiguous: false,
-                    probably_punctuation: false,
-                },
-                ExitDelimiterBoth,
+                NovelAtomLHS {},
             ]
         );
     }
@@ -361,7 +362,7 @@ mod tests {
         )];
         init_all_info(&lhs, &rhs);
 
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
+        let start = Vertex::new(lhs.first().copied(), rhs.first().copied());
         let vertex_arena = Bump::new();
         let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
 
@@ -372,15 +373,8 @@ mod tests {
                 EnterUnchangedDelimiter {
                     depth_difference: 0
                 },
-                NovelAtomRHS {
-                    contiguous: false,
-                    probably_punctuation: false
-                },
-                NovelAtomRHS {
-                    contiguous: false,
-                    probably_punctuation: false
-                },
-                ExitDelimiterBoth,
+                NovelAtomRHS {},
+                NovelAtomRHS {},
             ]
         );
     }
@@ -414,7 +408,7 @@ mod tests {
         )];
         init_all_info(&lhs, &rhs);
 
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
+        let start = Vertex::new(lhs.first().copied(), rhs.first().copied());
         let vertex_arena = Bump::new();
         let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
 
@@ -422,143 +416,17 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                EnterNovelDelimiterRHS { contiguous: false },
-                EnterNovelDelimiterLHS { contiguous: false },
+                EnterNovelDelimiterRHS {},
+                EnterNovelDelimiterLHS {},
                 UnchangedNode {
+                    probably_punctuation: false,
                     depth_difference: 0
                 },
                 UnchangedNode {
+                    probably_punctuation: false,
                     depth_difference: 0
                 },
-                ExitDelimiterRHS,
-                ExitDelimiterLHS,
             ],
-        );
-    }
-
-    #[test]
-    fn prefer_atoms_same_line() {
-        let arena = Arena::new();
-
-        let lhs = vec![
-            Syntax::new_atom(&arena, col_helper(1, 0), "foo", AtomKind::Normal),
-            Syntax::new_atom(&arena, col_helper(2, 0), "bar", AtomKind::Normal),
-            Syntax::new_atom(&arena, col_helper(2, 1), "foo", AtomKind::Normal),
-        ];
-
-        let rhs = vec![Syntax::new_atom(
-            &arena,
-            col_helper(1, 0),
-            "foo",
-            AtomKind::Normal,
-        )];
-        init_all_info(&lhs, &rhs);
-
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
-        let vertex_arena = Bump::new();
-        let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
-
-        let actions = route.iter().map(|(action, _)| *action).collect_vec();
-        assert_eq!(
-            actions,
-            vec![
-                UnchangedNode {
-                    depth_difference: 0
-                },
-                NovelAtomLHS {
-                    contiguous: false,
-                    probably_punctuation: false
-                },
-                NovelAtomLHS {
-                    contiguous: true,
-                    probably_punctuation: false
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn prefer_children_same_line() {
-        let arena = Arena::new();
-
-        let lhs = vec![Syntax::new_list(
-            &arena,
-            "[",
-            col_helper(1, 0),
-            vec![Syntax::new_atom(
-                &arena,
-                col_helper(1, 2),
-                "1",
-                AtomKind::Normal,
-            )],
-            "]",
-            pos_helper(2),
-        )];
-
-        let rhs = vec![];
-        init_all_info(&lhs, &rhs);
-
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
-        let vertex_arena = Bump::new();
-        let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
-
-        let actions = route.iter().map(|(action, _)| *action).collect_vec();
-        assert_eq!(
-            actions,
-            vec![
-                EnterNovelDelimiterLHS { contiguous: false },
-                NovelAtomLHS {
-                    contiguous: true,
-                    probably_punctuation: false
-                },
-                ExitDelimiterLHS,
-            ]
-        );
-    }
-
-    #[test]
-    fn atom_after_novel_list_contiguous() {
-        let arena = Arena::new();
-
-        let lhs = vec![
-            Syntax::new_list(
-                &arena,
-                "[",
-                col_helper(1, 0),
-                vec![Syntax::new_atom(
-                    &arena,
-                    col_helper(1, 2),
-                    "1",
-                    AtomKind::Normal,
-                )],
-                "]",
-                col_helper(2, 1),
-            ),
-            Syntax::new_atom(&arena, col_helper(2, 2), ";", AtomKind::Normal),
-        ];
-
-        let rhs = vec![];
-        init_all_info(&lhs, &rhs);
-
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
-        let vertex_arena = Bump::new();
-        let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
-
-        let actions = route.iter().map(|(action, _)| *action).collect_vec();
-        assert_eq!(
-            actions,
-            vec![
-                EnterNovelDelimiterLHS { contiguous: false },
-                NovelAtomLHS {
-                    contiguous: true,
-                    probably_punctuation: false
-                },
-                ExitDelimiterLHS,
-                NovelAtomLHS {
-                    contiguous: true,
-                    probably_punctuation: true
-                },
-            ]
         );
     }
 
@@ -581,7 +449,7 @@ mod tests {
         )];
         init_all_info(&lhs, &rhs);
 
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
+        let start = Vertex::new(lhs.first().copied(), rhs.first().copied());
         let vertex_arena = Bump::new();
         let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
 
@@ -613,7 +481,7 @@ mod tests {
         )];
         init_all_info(&lhs, &rhs);
 
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
+        let start = Vertex::new(lhs.first().copied(), rhs.first().copied());
         let vertex_arena = Bump::new();
         let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
 
@@ -653,7 +521,7 @@ mod tests {
         )];
         init_all_info(&lhs, &rhs);
 
-        let start = Vertex::new(lhs.get(0).copied(), rhs.get(0).copied());
+        let start = Vertex::new(lhs.first().copied(), rhs.first().copied());
         let vertex_arena = Bump::new();
         let route = shortest_path(start, &vertex_arena, 0, DEFAULT_GRAPH_LIMIT).unwrap();
 
@@ -664,10 +532,7 @@ mod tests {
                 ReplacedComment {
                     levenshtein_pct: 95
                 },
-                NovelAtomLHS {
-                    contiguous: false,
-                    probably_punctuation: false
-                }
+                NovelAtomLHS {}
             ]
         );
     }

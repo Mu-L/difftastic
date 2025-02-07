@@ -1,70 +1,141 @@
 # Git
 
-Git [supports external diff
-tools](https://git-scm.com/docs/diff-config#Documentation/diff-config.txt-diffexternal). You
-can use `GIT_EXTERNAL_DIFF` for a one-off git command.
+Difftastic can be used an external diff command in git, allowing
+difftastic to be used with any git subcommand.
+
+<div class="warning">
+
+Warning: git v2.43.1 and earlier [can
+crash](https://github.com/git/git/commit/85a9a63c9268b18b24f25f6a14d6ae9966c3566d)
+when using an external diff and file permissions have changed.
+
+If you can't upgrade git, use the `difftool` configuration described
+below.
+
+</div>
+
+## One-Off Usage
+
+You can set the `diff.external` configuration option when running `git
+diff`, or set the
+[`GIT_EXTERNAL_DIFF`](https://git-scm.com/docs/diff-config#Documentation/diff-config.txt-diffexternal) environment variable.
+
+View uncommitted changes with difftastic:
 
 ```
-$ GIT_EXTERNAL_DIFF=difft git diff
-$ GIT_EXTERNAL_DIFF=difft git log -p --ext-diff
-$ GIT_EXTERNAL_DIFF=difft git show e96a7241760319 --ext-diff
+$ git -c diff.external=difft diff
 ```
 
-If you want to use difftastic by default, use `git config`.
+Other git commands also require the `--ext-diff` argument in order to
+use `diff.external`.
+
+View changes from the most recent commit with difftastic:
 
 ```
-# Set git configuration for the current repository.
-$ git config diff.external difft
-
-# Set git configuration for all repositories.
-$ git config --global diff.external difft
+$ git -c diff.external=difft show --ext-diff
 ```
 
-After running `git config`, `git diff` will use `difft`
-automatically. Other git commands require `--ext-diff` to use
-`diff.external`.
+View changes from recent commits on the current branch with
+difftastic:
 
 ```
-$ git diff
-$ git log -p --ext-diff
-$ git show e96a7241760319 --ext-diff
+$ git -c diff.external=difft log -p --ext-diff
 ```
 
-## git-difftool
+## Regular Usage
 
-[git difftool](https://git-scm.com/docs/git-difftool) is a git command
-for viewing the current changes with a different diff tool. It's
-useful if you want to use difftastic occasionally.
+If you like difftastic, we recommend that you configure git aliases
+so you can use difftastic more easily.
 
-Add the
-following to your `.gitconfig` to use difftastic as your difftool.
+```ini
+[alias]
+    # Difftastic aliases, so `git dlog` is `git log` with difftastic and so on.
+    dlog = -c diff.external=difft log --ext-diff
+    dshow = -c diff.external=difft show --ext-diff
+    ddiff = -c diff.external=difft diff
+```
+
+The author likes the following additional aliases to reduce typing:
+
+```ini
+[alias]
+    # `git log` with patches shown with difftastic.
+    dl = -c diff.external=difft log -p --ext-diff
+
+    # Show the most recent commit with difftastic.
+    ds = -c diff.external=difft show --ext-diff
+
+    # `git diff` with difftastic.
+    dft = -c diff.external=difft diff
+```
+
+## Difftastic By Default
+
+If you want to use difftastic as your default diff tool, add the
+following to your `~/.gitconfig`.
 
 ```ini
 [diff]
-        tool = difftastic
-
-[difftool]
-        prompt = false
-
-[difftool "difftastic"]
-        cmd = difft "$LOCAL" "$REMOTE"
+    external = difft
 ```
 
-You can then run `git difftool` to see current changes with difftastic.
+This changes `git diff` to use difftastic, and other commands now only
+require `--ext-diff`.
 
 ```
-$ git difftool
+$ git diff
+$ git show --ext-diff
+$ git log -p --ext-diff
 ```
 
-We also recommend the following settings to get the best difftool
-experience.
+If you've configured difftastic as the default diff tool, you can
+opt-out for an individual command with `--no-ext-diff`.
+
+```
+$ git diff --no-ext-diff
+```
+
+## Difftool
+
+Git also has a [difftool
+feature](https://git-scm.com/docs/git-difftool) which allows users to
+invoke CLI or GUI comparison tools.
+
+For best results, we recommend using `-c diff.external=difft` as
+described above. Git passes more information to the external diff,
+including file permission changes and rename information, so
+difftastic can show more information.
+
+To define a difftool named `difftastic`, add the following to your
+`~/.gitconfig`.
 
 ```ini
-# Use a pager for large output, just like other git commands.
-[pager]
-        difftool = true
+[difftool "difftastic"]
+    # See `man git-difftool` for a description of MERGED, LOCAL and REMOTE.
+    cmd = difft "$MERGED" "$LOCAL" "abcdef1" "100644" "$REMOTE" "abcdef2" "100644"
+```
 
-# `git dft` is less to type than `git difftool`.
-[alias]
-        dft = difftool
+You can now use difftastic as a difftool:
+
+```
+$ git difftool -t difftastic
+```
+
+For the best results when using difftastic as a difftool, we recommend
+the following additional git configuration:
+
+```ini
+[difftool]
+    # Run the difftool immediately, don't ask 'are you sure' each time.
+    prompt = false
+
+[pager]
+    # Use a pager if the difftool output is larger than one screenful,
+    # consistent with the behaviour of `git diff`.
+    difftool = true
+
+[diff]
+    # Set difftastic as the default difftool, so we don't need to specify
+    # `-t difftastic` every time.
+    tool = difftastic
 ```

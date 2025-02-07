@@ -1,33 +1,33 @@
 //! Find nodes that are obviously unchanged, so we can run the main
 //! diff on smaller inputs.
 
-use std::collections::HashSet;
+use std::hash::Hash;
 
 use crate::diff::changes::{insert_deep_unchanged, ChangeKind, ChangeMap};
 use crate::diff::myers_diff;
-
+use crate::hash::DftHashSet;
 use crate::parse::syntax::Syntax;
 
 const TINY_TREE_THRESHOLD: u32 = 10;
 const MOSTLY_UNCHANGED_MIN_COMMON_CHILDREN: usize = 4;
 
-/// Set [`ChangeKind`] on nodes that are obviously unchanged, and return a
-/// vec of pairs that need proper diffing.
-pub fn mark_unchanged<'a>(
+/// Set [`ChangeKind`] on nodes that have exactly the same structure
+/// on both sides, and return a vec of pairs that need proper diffing.
+pub(crate) fn mark_unchanged<'a>(
     lhs_nodes: &[&'a Syntax<'a>],
     rhs_nodes: &[&'a Syntax<'a>],
     change_map: &mut ChangeMap<'a>,
 ) -> Vec<(Vec<&'a Syntax<'a>>, Vec<&'a Syntax<'a>>)> {
     let (_, lhs_nodes, rhs_nodes) = shrink_unchanged_at_ends(lhs_nodes, rhs_nodes, change_map);
 
-    let mut res = vec![];
+    let mut nodes_to_diff = vec![];
     for (lhs_nodes, rhs_nodes) in split_mostly_unchanged_toplevel(&lhs_nodes, &rhs_nodes) {
         let (_, lhs_nodes, rhs_nodes) =
             shrink_unchanged_at_ends(&lhs_nodes, &rhs_nodes, change_map);
-        res.extend(split_unchanged(&lhs_nodes, &rhs_nodes, change_map));
+        nodes_to_diff.extend(split_unchanged(&lhs_nodes, &rhs_nodes, change_map));
     }
 
-    res
+    nodes_to_diff
 }
 
 #[derive(Debug)]
@@ -123,7 +123,7 @@ fn split_unchanged_singleton_list<'a>(
     res
 }
 
-fn find_unique_content_ids(node: &Syntax, unique_ids: &mut HashSet<u32>) {
+fn find_unique_content_ids(node: &Syntax, unique_ids: &mut DftHashSet<u32>) {
     if node.content_is_unique() {
         unique_ids.insert(node.content_id());
     }
@@ -134,13 +134,13 @@ fn find_unique_content_ids(node: &Syntax, unique_ids: &mut HashSet<u32>) {
     }
 }
 
-fn find_all_unique_content_ids(node: &Syntax) -> HashSet<u32> {
-    let mut unique_ids = HashSet::new();
+fn find_all_unique_content_ids(node: &Syntax) -> DftHashSet<u32> {
+    let mut unique_ids = DftHashSet::default();
     find_unique_content_ids(node, &mut unique_ids);
     unique_ids
 }
 
-fn count_unique_subtrees(node: &Syntax, opposite_unique_ids: &HashSet<u32>) -> usize {
+fn count_unique_subtrees(node: &Syntax, opposite_unique_ids: &DftHashSet<u32>) -> usize {
     if node.content_is_unique() && opposite_unique_ids.contains(&node.content_id()) {
         // Ignore children as soon as find a unique node, to avoid
         // overcounting.
@@ -323,6 +323,24 @@ impl<X: Eq, Y> PartialEq for EqOnFirstItem<X, Y> {
 }
 impl<X: Eq, Y> Eq for EqOnFirstItem<X, Y> {}
 
+impl<X: Eq + PartialOrd, Y> PartialOrd for EqOnFirstItem<X, Y> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl<X: Eq + Ord, Y> Ord for EqOnFirstItem<X, Y> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl<X: Hash, Y> Hash for EqOnFirstItem<X, Y> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
 fn as_singleton_list_children<'a>(
     lhs_nodes: &[&'a Syntax<'a>],
     rhs_nodes: &[&'a Syntax<'a>],
@@ -442,21 +460,22 @@ fn shrink_unchanged_at_ends<'a>(
 
 #[cfg(test)]
 mod tests {
+    use typed_arena::Arena;
+
     use super::*;
     use crate::{
         parse::guess_language,
         parse::tree_sitter_parser::{from_language, parse},
         syntax::init_all_info,
     };
-    use typed_arena::Arena;
 
     #[test]
     fn test_shrink_unchanged_at_start() {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs_nodes = parse(&arena, "unchanged A B", &config);
-        let rhs_nodes = parse(&arena, "unchanged X", &config);
+        let lhs_nodes = parse(&arena, "unchanged A B", &config, false);
+        let rhs_nodes = parse(&arena, "unchanged X", &config, false);
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         let mut change_map = ChangeMap::default();
@@ -481,8 +500,8 @@ mod tests {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs_nodes = parse(&arena, "A B unchanged", &config);
-        let rhs_nodes = parse(&arena, "X unchanged", &config);
+        let lhs_nodes = parse(&arena, "A B unchanged", &config, false);
+        let rhs_nodes = parse(&arena, "X unchanged", &config, false);
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         let mut change_map = ChangeMap::default();
@@ -507,8 +526,18 @@ mod tests {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs_nodes = parse(&arena, "unchanged-before (more-unchanged (A))", &config);
-        let rhs_nodes = parse(&arena, "unchanged-before (more-unchanged (B))", &config);
+        let lhs_nodes = parse(
+            &arena,
+            "unchanged-before (more-unchanged (A))",
+            &config,
+            false,
+        );
+        let rhs_nodes = parse(
+            &arena,
+            "unchanged-before (more-unchanged (B))",
+            &config,
+            false,
+        );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         let mut change_map = ChangeMap::default();
@@ -533,8 +562,18 @@ mod tests {
         let config = from_language(guess_language::Language::EmacsLisp);
 
         // Make sure that the initial unchanged node exceeds TINY_TREE_THRESHOLD.
-        let lhs_nodes = parse(&arena, "(unchanged (1 2 3 4 5 6 7 8 9 10)) A B", &config);
-        let rhs_nodes = parse(&arena, "(unchanged (1 2 3 4 5 6 7 8 9 10)) X", &config);
+        let lhs_nodes = parse(
+            &arena,
+            "(unchanged (1 2 3 4 5 6 7 8 9 10)) A B",
+            &config,
+            false,
+        );
+        let rhs_nodes = parse(
+            &arena,
+            "(unchanged (1 2 3 4 5 6 7 8 9 10)) X",
+            &config,
+            false,
+        );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         let mut change_map = ChangeMap::default();
@@ -561,8 +600,18 @@ mod tests {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs_nodes = parse(&arena, "A B (unchanged (1 2 3 4 5 6 7 8 9 10))", &config);
-        let rhs_nodes = parse(&arena, "X (unchanged (1 2 3 4 5 6 7 8 9 10))", &config);
+        let lhs_nodes = parse(
+            &arena,
+            "A B (unchanged (1 2 3 4 5 6 7 8 9 10))",
+            &config,
+            false,
+        );
+        let rhs_nodes = parse(
+            &arena,
+            "X (unchanged (1 2 3 4 5 6 7 8 9 10))",
+            &config,
+            false,
+        );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         let mut change_map = ChangeMap::default();
@@ -589,8 +638,8 @@ mod tests {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs_nodes = parse(&arena, "(A)", &config);
-        let rhs_nodes = parse(&arena, "(B)", &config);
+        let lhs_nodes = parse(&arena, "(A)", &config, false);
+        let rhs_nodes = parse(&arena, "(B)", &config, false);
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         let mut change_map = ChangeMap::default();
@@ -620,11 +669,13 @@ mod tests {
             &arena,
             "novel-lhs (unchanged (1 2 3 4 5 6 7 8 9 10)) novel-lhs-2",
             &config,
+            false,
         );
         let rhs_nodes = parse(
             &arena,
             "novel-rhs (unchanged (1 2 3 4 5 6 7 8 9 10)) novel-rhs-2",
             &config,
+            false,
         );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
@@ -656,12 +707,12 @@ mod tests {
         let lhs_nodes = parse(
             &arena,
             "novel-lhs (unchanged-1 (1 2 3 4 5 6 7 8 9 10)) (unchanged-2 (1 2 3 4 5 6 7 8 9 10)) novel-lhs-2",
-            &config,
+            &config, false,
         );
         let rhs_nodes = parse(
             &arena,
             "novel-rhs (unchanged-1 (1 2 3 4 5 6 7 8 9 10)) (unchanged-2 (1 2 3 4 5 6 7 8 9 10)) novel-rhs-2",
-            &config,
+            &config, false,
         );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
@@ -685,11 +736,13 @@ mod tests {
             &arena,
             "(novel-lhs-before (1 2 3 4 5 6 7 8 9 10) novel-lhs-after)",
             &config,
+            false,
         );
         let rhs_nodes = parse(
             &arena,
             "(novel-rhs-before (1 2 3 4 5 6 7 8 9 10) novel-rhs-after)",
             &config,
+            false,
         );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
@@ -712,11 +765,13 @@ mod tests {
             &arena,
             "(1 2 3 4 5 6 7 8 9 10) (91 92 93 94 95 96 97 98 99 100)",
             &config,
+            false,
         );
         let rhs_nodes = parse(
             &arena,
             "(1 2 3 4 5 novel-1 6 7 8 9 10) (91 92 93 94 95 novel-2 96 97 98 99 100)",
             &config,
+            false,
         );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
@@ -738,11 +793,13 @@ mod tests {
             &arena,
             "(shared-1 (shared-2a shared-2b) not-unique not-unique)",
             &config,
+            false,
         );
         let rhs_nodes = parse(
             &arena,
             "(shared-1 (shared-2a shared-2b) not-unique)",
             &config,
+            false,
         );
         init_all_info(&lhs_nodes, &rhs_nodes);
 
@@ -754,8 +811,8 @@ mod tests {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs_nodes = parse(&arena, "((novel-lhs 1 2 3 4 5)) x", &config);
-        let rhs_nodes = parse(&arena, "((novel-rhs 1 2 3 4 5)) y", &config);
+        let lhs_nodes = parse(&arena, "((novel-lhs 1 2 3 4 5)) x", &config, false);
+        let rhs_nodes = parse(&arena, "((novel-rhs 1 2 3 4 5)) y", &config, false);
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         assert_eq!(
@@ -768,8 +825,8 @@ mod tests {
         let arena = Arena::new();
         let config = from_language(guess_language::Language::EmacsLisp);
 
-        let lhs_nodes = parse(&arena, "(novel-lhs 1 2 3 4 5) x", &config);
-        let rhs_nodes = parse(&arena, "[novel-rhs 1 2 3 4 5] y", &config);
+        let lhs_nodes = parse(&arena, "(novel-lhs 1 2 3 4 5) x", &config, false);
+        let rhs_nodes = parse(&arena, "[novel-rhs 1 2 3 4 5] y", &config, false);
         init_all_info(&lhs_nodes, &rhs_nodes);
 
         assert_eq!(

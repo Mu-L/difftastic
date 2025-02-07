@@ -1,4 +1,700 @@
-## 0.38 (unreleased)
+## 0.63 (unreleased)
+
+### Diffing
+
+When diffing directories, difftastic now ignores the `.git` directory.
+
+### Display
+
+Fixed an issue where `--display=side-by-side-show-both` would not use
+a two-column display when one file was empty.
+
+### Command Line Interface
+
+Difftastic no longer accepts the `--missing-as-empty`. This has had no
+effect since 0.46.
+
+### Parsing
+
+File detection now supports Windows-1252 encoded test (an extension of
+ISO-8859-1), and is stricter about UTF-16 detection.
+
+Updated to the latest tree-sitter parser for LaTeX, Make, Rust and
+YAML.
+
+### Build
+
+Releases now include prebuilt musl binaries.
+
+## 0.62 (released 20th December 2024)
+
+### Diffing
+
+Improved handling of multiline strings, which could cause a crash if
+they occurred at the end of the file. This was particularly noticeable
+with YAML.
+
+### Parsing
+
+Improved language detection when one argument is a named pipe.
+
+Updated to the latest tree-sitter parser for Bash, C, C++, C#, CSS,
+Go, Haskell, HTML, Java, JavaScript, JSON, Julia, Lua, Objective-C,
+OCaml, PHP, Python, Ruby, Scala, TOML, TypeScript and XML.
+
+### Syntax Highlighting
+
+Improved syntax highlighting, particularly for keywords.
+
+### Build
+
+difftastic now requires Rust 1.74.1 to build.
+
+Prebuilt packages for macOS on x86-64 are now built on macOS 13.
+
+## 0.61 (released 24th October 2024)
+
+**Recommended git configuration has changed! Please update your
+`~/.gitconfig` to [match the git
+instructions](https://difftastic.wilfred.me.uk/git.html), regardless
+of your difftastic version.**
+
+### Display
+
+Side-by-side display is now smarter on very wide terminals when the
+content is narrow.
+
+### Diffing
+
+Fixed a crash (introduced in 0.60) when the final line in a file does
+not have a trailing newline and occurs more than once in the file.
+
+### Build
+
+difftastic now requires Rust 1.66 to build.
+
+## 0.60 (released 1st August 2024)
+
+### Diffing
+
+Fixed a crash (introduced in 0.59) when the final changed hunk
+included the last line of the file.
+
+### Display
+
+Fixed an issue where files with no common content would show duplicate
+hunks.
+
+Fixed a performance issue when files had extremely long lines
+(e.g. 100,000+ characters).
+
+## 0.59 (released 20th July 2024)
+
+### Diffing
+
+Fixed crash on some textual files where a single change contained more than
+1,000 words.
+
+### Parsing
+
+Added support for device tree and F#.
+
+Difftastic now uses tree-sitter comment highlighing as a hint that
+nodes should be treated as atoms. This ensures comments are treated
+more consistently across languages. This fixes cases in Elm where
+comment differences were ignored, and may improve other languages too.
+
+## 0.58 (released 11th May 2024)
+
+### Parsing
+
+Difftastic now preserves tree-sitter parse tree structure on parse
+error nodes. This reverts the flattening behaviour introduced in
+0.38. Preserving structure tends to produce better diffs, although it
+increases the risk that difftastic will show fewer changes in the
+presence of parse errors.
+
+Since difftastic is now conservative with parse errors
+(DFT_PARSE_ERROR_LIMIT is 0 by default), this seems like a better
+tradeoff.
+
+Updated C, C++, CMake, CSS, Elm, Go, Lua and Python parsers.
+
+### Diffing
+
+`--strip-cr` now defaults to `on`, so comparing a file with CRLF
+endings with a file with unix line endings will not show spurious
+changes.
+
+### Documentation
+
+Difftastic now has a man page, see the `difft.1` file.
+
+### Performance
+
+Fixed a memory leak and improved performance in some cases.
+
+### Command Line Interface
+
+Fixed a crash when difftastic could not detect the terminal width,
+such as inside eshell.
+
+Difftastic now also considers $COLUMNS when detecting the terminal
+width.
+
+## 0.57 (released 1st April 2024)
+
+### Parsing
+
+Text file detection is now stricter, considering null bytes as a hint
+that files are binaries.
+
+### Diffing
+
+Fixed an issue where hidden files (filename starting with `.`) were
+ignored when diffing directories.
+
+Scheme now uses the same slider heuristics as other lisps, preferring
+the outer delimiter.
+
+Fixed an issue with line-based diffing where only the first line in a
+large changed region was highlighted. This was particularly noticeable
+when diffing brand new files.
+
+### Display
+
+Fixed an issue when reporting changes in binary files, where trailing
+whitespace was inconsistent with other changes shown.
+
+## 0.56.1 (released 5th March 2024)
+
+### Build
+
+Fixed an issue with building difftastic on aarch64 with rust 1.71 or
+earlier.
+
+## 0.56 (released 5th March 2024)
+
+### Parsing
+
+Updated JavaScript, TypeScript, QML and Perl parsers.
+
+`Makefile*.in` is now detected as Makefile syntax.
+
+Improved shebang parsing with whitespace, e.g. `#! /bin/bash` is now
+detected as a shell script.
+
+Added support for Scheme and Smali.
+
+### Diffing
+
+Fixed an issue with runaway memory usage on text files with very long
+lines.
+
+### Display
+
+Fixed an issue where all files would show a permissions change when
+using difftastic with `git difftool`.
+
+Fixed an issue with paths not showing the containing directory when
+using difftastic with `git difftool`.
+
+Difftastic now correctly reports file permission changes when called
+from `git diff`.
+
+Fixed an issue with the experimental JSON display mode where it
+ignored `--skip-unchanged`.
+
+Fixed an issue with tabs not being replaced in single-column display.
+
+## 0.55 (released 1st February 2024)
+
+### Parsing
+
+Added support for Objective-C and VHDL.
+
+Files starting with `<?xml` are now parsed as XML.
+
+Fixed a `munmap_chunk(): invalid pointer` crash on parsing some
+large files, particularly JSON.
+
+### Display
+
+The default display width for tabs has changed to 4.
+
+Fixed an issue where difftastic would sometimes output literal tabs
+rather than respecting the display width for tabs.
+
+### Build
+
+difftastic now requires Rust 1.65 to build.
+
+## 0.54 (released 7th January 2024)
+
+### Parsing
+
+Added support for Salesforce Apex.
+
+Improved parsing of regex literals in Clojure and strictness
+annotations in Haskell.
+
+### Diffing
+
+Difftastic will now also report file permission changes.
+
+Fixed an issue where directory diffing would show a file more than
+once.
+
+### Display
+
+Fixed a rare crash when the last non-blank line had changes for
+certain parsers, particularly YAML.
+
+### Command Line Interface
+
+Difftastic now errors if given a single path, unless that file
+contains conflict markers. Previously this was a warning.
+
+### Build
+
+Difftastic now requires Rust 1.63 to build.
+
+## 0.53.1 (released 26th November 2023)
+
+### Build
+
+Fixed a dependency issue that broke aarch64 builds on older rustc versions.
+
+## 0.53 (released 24th November 2023)
+
+### Parsing
+
+Added support for SCSS.
+
+Updated the Kotlin parser and improved handling of Kotlin nullable
+types.
+
+`.snap` files (Jest snapshots) are now detected as JavaScript files.
+
+### Diffing
+
+Fixed an issue where adding or removing blank lines would be ignored
+by the textual diffing logic.
+
+Directory diffing now respects `.gitignore` files.
+
+Directory diffing can now be sorted by path with the `--sort-paths`
+option.
+
+### Command Line Interface
+
+Added the option `--strip-cr`. This removes all carriage return
+characters before diffing, which is helpful when dealing with a mix of
+Windows and non-Windows flies.
+
+The option `--skip-unchanged` now has a corresponding environment
+option `DFT_SKIP_UNCHANGED`.
+
+### Build
+
+Difftastic now requires Rust 1.60 to build.
+
+## 0.52 (released 8th October 2023)
+
+### Parsing
+
+Added support for XML and JSONL.
+
+### Diffing
+
+Text nodes now get word diffing, consistent with string literals and
+comments. This is used in languages like HTML and XML that have
+separate text nodes.
+
+### Display
+
+Improved syntax highlighting of constructors (i.e. type names when
+values are constructed, such as `Foo {}`).
+
+Improved syntax highlighting for C#.
+
+### Build
+
+This release does not provide a prebuilt musl binary, due
+to [a dynamic linking
+issue](https://github.com/Wilfred/difftastic/issues/563) with binaries
+in the release script.
+
+musl remains tested in CI and supported for users, but you will need
+to compile difftastic from source.
+
+## 0.51.1 (released 25th August 2023)
+
+Fixed an issue with GitHub actions that prevented prebuilt binaries
+being attached to the release.
+
+This is the same code as 0.51.0 otherwise.
+
+## 0.51.0 (released 25th August 2023)
+
+### Parsing
+
+Updated Bash, Python and Rust parsers.
+
+### Display
+
+Added a JSON display option. This is currently unstable, and requires
+you to set DFT_UNSTABLE. The JSON structure may change in future.
+
+Please give it a try and give feedback on GitHub issues.
+
+### Build
+
+Added support for Linux with musl, Linux on aarch64, and macOS on
+aarch64.
+
+Note that Difftastic already worked on these platforms, but they are
+now tested in CI and will be included in prebuilt binaries in
+releases.
+
+## 0.50 (released 15th August 2023)
+
+### Conflicts
+
+Difftastic now supports parsing files with conflict markers, enabling
+you to diff the two conflicting file states.
+
+```
+$ difft file_with_conflicts.js
+```
+
+### Parsing
+
+Updated Elixir, Erlang, Go, Kotlin and Racket parsers.
+
+### Display
+
+Tweaked the colours on the file header, to make metadata less
+prominent.
+
+Improved styling of file rename information.
+
+Improved syntax hightling for Java built-in types.
+
+### Diffing
+
+Fixed an issue with runaway memory usage when the two files input
+files had a large number of differences.
+
+### Build
+
+Difftastic now requires Rust 1.59 to build.
+
+## 0.49 (released 26th July 2023)
+
+### Parsing
+
+Added support for LaTeX.
+
+Updated grammars for C, C++ and Java.
+
+Improved parsing of qualified constructors in Haskell.
+
+Difftastic is now stricter about valid UTF-8 and UTF-16, considering
+more of the file's bytes during filetype detection. This fixes cases
+where e.g. PDF was sometimes incorrectly considered as UTF-8.
+
+### Diffing
+
+Improved handling of delimiters ("nested sliders") in languages that
+prefer the outer delimiter, such as JSON and Lisps.
+
+### Build
+
+Difftastic now requires Rust 1.58 to build.
+
+## 0.48 (released 12th July 2023)
+
+### Parsing
+
+Updated Scala parser.
+
+Improved parsing of qualified modules and variables in Haskell.
+
+### Diffing
+
+Replaced strings now have subword highlighting, consistent with
+replaced comments. Thanks @amnore!
+
+Fixed an issue with the cost model for comment replacement, leading
+difftastic to prefer modified comments even when exact comment matches
+are possible.
+
+Simplified the cost model, which previously had an inconsistent
+heuristic depending on whether there were multiple items on the same
+line. This can lead to slightly different items being marked as
+changed, but on average the results are better.
+
+### Display
+
+Improved word highlighting in comments when they contain numbers or
+hyphens.
+
+### Internals
+
+Difftastic's logging is now configured with the environment variable
+`DFT_LOG`. This was previously `RUST_LOG`, which could interfere with
+users configuring logging for their own development work.
+
+## 0.47 (released 16th May 2023)
+
+### Language Detection
+
+Fixed an issue where file extensions of the form `*.foo.bar`
+(e.g. `*.cmake.in`) were ignored.
+
+Added an option `--override` which overrides language detection based
+on a glob, e.g. `--override='*.js:javascript jsx'`. See `--help` for
+full documentation and more examples.
+
+Removed the `--language` option. This option was confusing (it took a
+file extension rather than a language name) and not very useful
+(it overrode language detection for all files together).
+
+### Parsing
+
+Added support for Solidity.
+
+### Display
+
+When difftastic is invoked with two file paths, it will now truncate
+the path shown to the shared common parts. This is particularly
+helpful when using difftastic with mercurial.
+
+```
+$ difft dir1/foo/bar.py dir2/foo/bar.py
+foo/bar.py -- Python
+...
+```
+
+## 0.46 (released 31st March 2023)
+
+### Command Line Interface
+
+Removed the option `--missing-as-empty`. This is no longer needed as
+difftastic handles `/dev/null` gracefully on all platforms.
+
+### Parsing
+
+Added support for Ada.
+
+`.ino` files are now treated as C++.
+
+Improved parsing for TOML.
+
+Updated grammars for Bash, C, C++, C#, Clojure, CMake, Elixir, Go,
+Java, JavaScript, OCaml, Perl, QML and TypeScript.
+
+Difftastic now prefers treating files as 'mostly UTF-8' or binary rather than
+UTF-16. Many files can be decoded as UTF-16 without decoding errors
+but produce nonsense results, so this heuristic seems to work better.
+
+Fixed an issue where difftastic would discard the last newline in a
+file before diffing. This was most noticeable when doing textual diffs
+and the last line had changed.
+
+### Display
+
+Difftastic no longer uses purple to highlight regions that are missing
+styling. This was intended as a debug feature, but it in practice it
+only highlighted trailing whitespace for a few languages.
+
+## 0.45 (released 3rd March 2023)
+
+### Diffing
+
+Racket and Newick are now treated as lisps for the purposes for
+parenthesis heuristics.
+
+### Parsing
+
+Fixed an issue where parse errors were undercounted, particularly in
+YAML files.
+
+Improved parsing for Makefiles.
+
+## 0.44 (released 2nd March 2023)
+
+### Parsing
+
+Added support for Newick and Racket.
+
+### Diffing
+
+Difftastic now uses a textual diff on files that have any parse
+errors. The parse error limit defaults to 0, but it is configurable
+with `DFT_PARSE_ERROR_LIMIT` or `--parse-error-limit`.
+
+Textual diffing now respects `--check-only`, consistent with syntactic
+diffing.
+
+### Display
+
+Improved syntax highlighting for keywords.
+
+If a file exceeds `DFT_BYTE_LIMIT`, difftastic now displays its size in
+the header.
+
+## 0.43.1 (released 3rd February 2023)
+
+This release has no logic changes from 0.43.
+
+The only difference is that the `test_gzip_is_binary` test is ignored by default, as it depends on MIME database availability. This database isn't always installed in packaging environments, so packagers saw this test failing.
+
+## 0.43 (released 3rd February 2023)
+
+### Parsing
+
+Added support for R.
+
+Difftastic now considers gzipped files to be binary, even if they
+happen to be valid UTF-16.
+
+### Diffing
+
+Fixed a rare crash when one file had repeated lists that partially
+matched the other side.
+
+### Display
+
+Fixed an issue with single-column display when colour is disabled,
+where newlines were missing from the output.
+
+### Command Line Interface
+
+`--help` now shows the default value for all arguments (it was
+previously missing `--color` and `--display`).
+
+`--color` can now be configured with the environment variable
+`DFT_COLOR`.
+
+Fixed an issue where git on Windows would fail with an error about
+`/dev/null`.
+
+## 0.42 (released 15th January 2023)
+
+### Parsing
+
+Improved CSS parsing and HTML sublanguage parsing.
+
+### Diffing
+
+Added an `--ignore-comments` option.
+
+Improved textual diffing performance, particularly when the two files
+have few lines in common.
+
+### Display
+
+Fixed an issue with unwanted underlines with textual diffing when
+DFT_BYTE_LIMIT is reached.
+
+Fixed a crash in inline display when the file ends with whitespace.
+
+### Build
+
+Renamed the vendored parser directory to vendored_parsers/, as `cargo
+vendor` would clobber the `vendor/` directory.
+
+## 0.41 (released 8th January 2023)
+
+### Parsing
+
+Difftastic now supports embedded languages in HTML and Makefiles. This
+enables difftastic to parse embedded CSS or JavaScript in HTML, or
+Bash in Makefiles, leading to better diffs in those files.
+
+Tab replacement is now done after parsing. If tab characters are
+syntactically important, they are now handled correctly. This was
+particularly an issue in Makefiles, where indentation must be tabs.
+
+### Diffing
+
+Improved word highlighting in changed comments. Whitespace is never
+underlined and the characters `-` and `_` are now considered word
+constituents.
+
+### Display
+
+`--display=inline` now respects `--tab-width`.
+
+Fixed an issue with unwanted underlines with textual diffing when
+DFT_GRAPH_LIMIT is reached.
+
+Improved syntax highlighting for predefined types in TypeScript.
+
+## 0.40 (released 28th December 2022)
+
+### Diffing
+
+Diffing is now more efficient: the generated graphs have ~20% fewer
+vertices. This improves performance (less memory, shorter runtime),
+and also enables difftastic to handle larger files (you're less likely
+to reach `DFT_GRAPH_LIMIT`).
+
+This improvement was contributed by @QuarticCat, thanks!
+
+### Parsing
+
+`rebar` files (e.g. `rebar.lock`) are no longer associated with
+Erlang, only `*.erl` files, as the Erlang parser does not currently
+support them.
+
+### Command Line Interface
+
+`--list-languages` now shows filenames associated with languages
+(e.g. `Cargo.lock` is TOML) in addition to extensions.
+
+### Display
+
+Symlinks are now expanded before calculating relative paths, resulting
+in relative paths being shown in more cases.
+
+### Build
+
+Difftastic is now built with Ubuntu 20.04 on GitHub, so prebuilt
+binaries do not require libc version 2.32. This was broken in 0.39 due
+to a GitHub default changing.
+
+## 0.39 (released 19th December 2022)
+
+### Parsing
+
+Added support for Erlang.
+
+Improved detection of binary content when the MIME type database
+incorrectly claims a text file is another format.
+
+### Display
+
+Paths are now always displayed relative to the current working
+directory.
+
+Fixed a race condition where diffing directories would lead to
+interleaved output from different files.
+
+### Command Line Interface
+
+Added a `--check-only` flag that reports if there are any syntactic
+differences, but doesn't calculate or print them. This is much faster
+than normal syntactic diffing.
+
+Difftastic now sets the exit code if it finds changes and
+`--exit-code` is set. See [usage in the
+manual](https://difftastic.wilfred.me.uk/usage.html) for the full list
+of exit codes used.
+
+## 0.38 (released 14th November 2022)
 
 ### Parsing
 
@@ -17,6 +713,9 @@ distinct from file content.
 
 Fixed an issue with inline display discarding newlines when color is
 disabled, leading to broken display.
+
+Two column display now ensures that both columns have the same width,
+so line wrapping is at the same point on both sides.
 
 ## 0.37 (released 14th October 2022)
 

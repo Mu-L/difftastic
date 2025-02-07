@@ -1,7 +1,7 @@
 <p align="center">
   <a href="#readme"><img src="img/logo.png" alt="it's difftastic!"/></a>
   <br>
-  <a href="http://difftastic.wilfred.me.uk/"><img src="https://img.shields.io/badge/manual-en-brightgreen?style=flat-square" alt="English manual"></a>
+  <a href="https://difftastic.wilfred.me.uk/introduction.html"><img src="https://img.shields.io/badge/manual-en-brightgreen?style=flat-square" alt="English manual"></a>
   <a href="https://difftastic.wilfred.me.uk/zh-CN/"><img src="https://img.shields.io/badge/manual-zh--CN-brightgreen?style=flat-square" alt="Chinese manual"></a>
   <a href="https://crates.io/crates/difftastic"><img src="https://img.shields.io/crates/v/difftastic.svg?style=flat-square" alt="crates.io"></a>
   <a href="https://codecov.io/gh/Wilfred/difftastic"><img src="https://img.shields.io/codecov/c/github/Wilfred/difftastic?style=flat-square&token=dZzAZtQT2S" alt="codecov.io"></a>
@@ -25,7 +25,8 @@ In this JavaScript example, we can see:
 whitespace.
 
 (2) Difftastic understands which lines should be aligned. It's aligned
-`bar()` on the left with `bar(1)` on the right, despite their changes.
+`bar(1)` on the left with `bar(2)` on the right, even though the
+textual content isn't identical.
 
 (3) Difftastic understands that line-wrapping isn't
 meaningful. `"eric"` is now on a new line, but it hasn't changed.
@@ -40,7 +41,7 @@ standalone files and git.
 ## Languages
 
 Difftastic supports over 30 programming languages, see [the
-manual](https://difftastic.wilfred.me.uk/) for the full list.
+manual](https://difftastic.wilfred.me.uk/languages_supported.html) for the full list.
 
 If a file has an unrecognised extension, difftastic uses a
 textual diff with word highlighting.
@@ -95,6 +96,80 @@ showing one way to use difftastic with magit.
 Probably not. Difftastic is young. Consider writing a plugin for your
 favourite tool, and I will link it in the README!
 
+### Can difftastic help me with merge conflicts?
+
+Yes! As of version 0.50, difftastic understands merge conflict markers
+(i.e. `<<<<<<<`, `=======` and `>>>>>>>`).
+
+Pass your file with conflicts as a single argument to
+difftastic. Difftastic will construct the two conflicting files and
+diff those.
+
+```
+$ difft file_with_conflicts.js
+```
+
+### Can difftastic do merges?
+
+No. AST merging is a hard problem that difftastic does not address.
+
+AST diffing is a lossy process from the perspective of a text
+diff. Difftastic will ignore whitespace that isn't syntactically
+significant, but merging requires tracking whitespace.
+
+The [mergiraf](https://mergiraf.org/) tool does offer merges based on
+a tree-sitter AST however.
+
+### Can difftastic ignore reordering?
+
+No. Difftastic always considers order to be important, so diffing
+e.g. `set(1, 2)` and `set(2, 1)` will show changes.
+
+If you're diffing JSON, consider sorting the keys before passing them
+to difftastic.
+
+```
+$ difft <(jq --sort-keys < file_1.json) <(jq --sort-keys < file_2.json)
+```
+
+See also [Tricky Cases: Unordered Data
+Types](https://difftastic.wilfred.me.uk/tricky_cases.html#unordered-data-types)
+in the manual.
+
+### Can I use difftastic to check for syntactic changes without diffing?
+
+Yes. Difftastic can check if the two files have the same AST, without
+calculating a diff. This is much faster than normal diffing, and
+useful for building tools that check for changes.
+
+For example:
+
+```
+$ difft --check-only --exit-code before.js after.js
+```
+
+This will set the exit code to 0 if there are no syntactic changes, or
+1 if there are changes found.
+
+### Why aren't colours appearing in my terminal?
+
+Difftastic uses ANSI bright colours by default, but some terminal
+themes show bright colours as grey. Solarized is a popular theme that
+does this.
+
+If you're a Solarized user, use `export DFT_BACKGROUND=light` to
+disable bright colours, or try a different terminal colour scheme.
+
+### How does it work?
+
+Difftastic treats structural diffing as a graph problem, and uses
+Dijkstra's algorithm.
+
+My [blog
+post](https://www.wilfred.me.uk/blog/2022/09/06/difftastic-the-fantastic-diff/)
+describes the design, and there is also an [internals section in the
+manual](https://difftastic.wilfred.me.uk/diffing.html).
+
 ## Translation
 
 + [Chinese](./translation/zh-CN/README-zh-CN.md)
@@ -105,8 +180,8 @@ Difftastic is open source under the MIT license, see LICENSE for more
 details.
 
 This repository also includes tree-sitter parsers by other authors in
-the `vendor/` directory. These are a mix of the MIT license and the
-Apache license. See `vendor/*/LICENSE` for more details.
+the `vendored_parsers/` directory. These are a mix of the MIT license and the
+Apache license. See `vendored_parsers/*/LICENSE` for more details.
 
 Files in `sample_files/` are also under the MIT license unless stated
 otherwise in their header.
